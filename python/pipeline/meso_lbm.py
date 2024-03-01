@@ -15,8 +15,8 @@ import hashlib
 
 from . import experiment, injection, notify, shared
 from .utils import galvo_corrections, signal, quality, mask_classification, performance
+from .utils import caiman_interface as cmn
 from .exceptions import PipelineException
-import caiman_interface as cmn
 
 # Make sure you have correct version of scanreader
 import subprocess
