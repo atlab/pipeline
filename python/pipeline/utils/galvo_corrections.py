@@ -328,6 +328,7 @@ def _get_field_size_info(key):
     # Define virtual modules here to prevent circular imports
     reso = dj.create_virtual_module("reso", "pipeline_reso")
     meso = dj.create_virtual_module("meso", "pipeline_meso")
+    meso_lbm = dj.create_virtual_module("meso", "mgagnon_meso_lbm_dev")
 
     # Fetch relevant field size info
     if len(reso.ScanInfo & key) > 0:
@@ -336,6 +337,10 @@ def _get_field_size_info(key):
         )
     elif len(meso.ScanInfo & key) > 0:
         px_height, px_width, um_height, um_width = (meso.ScanInfo.Field & key).fetch1(
+            "px_height", "px_width", "um_height", "um_width"
+        )
+    elif len(meso_lbm.ScanInfo & key) > 0:
+        px_height, px_width, um_height, um_width = (meso_lbm.ScanInfo.Field & key).fetch1(
             "px_height", "px_width", "um_height", "um_width"
         )
     else:
@@ -351,16 +356,25 @@ def _get_pipe(key):
     # Define virtual modules here to prevent circular imports
     reso = dj.create_virtual_module("reso", "pipeline_reso")
     meso = dj.create_virtual_module("meso", "pipeline_meso")
+    meso_lbm = dj.create_virtual_module("meso_lbm", "mgagnon_meso_lbm_dev")
     
-    if len(reso.ScanInfo & key) > 0 and len(meso.ScanInfo & key) > 0:
-        raise PipelineException(f"Found key in both meso and reso: {key}.")
+    if len(reso.ScanInfo & key) > 0 and len(meso.ScanInfo & key) > 0 and len(meso_lbm.ScanInfo & key):
+        raise PipelineException(f"Found key in both meso, reso, and meso_lbm: {key}.")
+    elif len(reso.ScanInfo & key) > 0 and len(meso.ScanInfo & key) > 0:
+        raise PipelineException(f"Found key in both reso and meso: {key}.")
+    elif len(reso.ScanInfo & key) > 0 and len(meso_lbm.ScanInfo & key) > 0:
+        raise PipelineException(f"Found key in both reso and meso_lbm: {key}.")
+    elif len(meso.ScanInfo & key) > 0 and len(meso_lbm.ScanInfo & key) > 0:
+        raise PipelineException(f"Found key in both meso and meso_lbm: {key}.")
+
     elif len(reso.ScanInfo & key) > 0:
         return reso
     elif len(meso.ScanInfo & key) > 0:
         return meso
+    elif len(meso_lbm.ScanInfo & key) > 0:
+        return meso_lbm
     else:
-        raise PipelineException(f"Could not find key in meso or reso: {key}.")
-        
+        raise PipelineException(f"Could not find key in reso, meso, or meso_lbm: {key}.")   
 def _get_correct_raster(key):
     """
     Small utility function to return function which corrects Raster phase

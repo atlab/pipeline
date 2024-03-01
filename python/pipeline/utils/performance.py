@@ -5,7 +5,7 @@ import time
 
 
 def map_frames(f, scan, field_id, channel, y=slice(None), x=slice(None), kwargs={},
-               chunk_size_in_GB=0.5, num_processes=10, queue_size=10):
+               chunk_size_in_GB=0.5, num_processes=10, queue_size=10, bead_id=None):
     """ Apply function f to chunks of the scan (divided in the temporal axis).
 
     :param function f: Function that receives two positional arguments:
@@ -21,7 +21,7 @@ def map_frames(f, scan, field_id, channel, y=slice(None), x=slice(None), kwargs=
     :param int chunk_size_in_GB: Desired size of each chunk.
     :param int num_processes: Number of processes to use for mapping.
     :param int queue_size: Maximum size of the queue used to store chunks.
-
+    :param int bead_id: Which bead to use, optional. 0-based
     :returns list results: List with results per chunk of scan. Order is not guaranteed.
     """
     # Basic checks
@@ -32,7 +32,11 @@ def map_frames(f, scan, field_id, channel, y=slice(None), x=slice(None), kwargs=
     print('Using', num_processes, 'processes')
 
     # Calculate the number of frames per chunk
-    one_frame = scan[field_id, y, x, channel, 0]
+    # For lbm scans, index the additional 'bead' dimension
+    if getattr(scan, 'is_lbm', False):
+        one_frame = scan[field_id, bead_id, y, x, channel, 0]
+    else:
+        one_frame = scan[field_id, y, x, channel, 0]
     bytes_per_frame = np.prod(one_frame.shape) * 4 # 4 bytes per pixel
     chunk_size = int(round((chunk_size_in_GB * 1024**3) / bytes_per_frame))
 
@@ -59,7 +63,10 @@ def map_frames(f, scan, field_id, channel, y=slice(None), x=slice(None), kwargs=
         num_frames = scan.num_frames
     for i in range(0, num_frames, chunk_size):
         frames = slice(i, min(i + chunk_size, num_frames))
-        chunks.put((frames, scan[field_id, y, x, channel, frames])) # frames, chunk tuples
+        if getattr(scan, 'is_lbm', False):
+            chunks.put((frames, scan[field_id, bead_id, y, x, channel, frames])) # frames, chunk tuples
+        else:
+            chunks.put((frames, scan[field_id, y, x, channel, frames])) # frames, chunk tuples
         # chunks.put(((field_id, y, x, channel, frames), scan.filenames)) # scan_slices, filenames tuples
 
     # Queue STOP signal
@@ -315,7 +322,7 @@ def _correct_field(field, raster_phase, fill_fraction, x_shifts, y_shifts):
 ################################## Stacks ##############################################
 
 def map_fields(f, scan, field_ids, channel, y=slice(None), x=slice(None),
-               frames=slice(None), kwargs={}, num_processes=10, queue_size=10):
+               frames=slice(None), kwargs={}, num_processes=10, queue_size=10, bead_id=None):
     """ Apply function f to each field in scan
 
     :param function f: Function that receives two positional arguments:
@@ -352,7 +359,10 @@ def map_fields(f, scan, field_ids, channel, y=slice(None), x=slice(None),
 
     # Produce data
     for i, field_id in enumerate(field_ids):
-        chunks.put((i, scan[field_id, y, x, channel, frames])) # field_idx, field tuples
+        if getattr(scan, 'is_lbm', False):
+            chunks.put((i, scan[field_id, bead_id, y, x, channel, frames])) # field_idx, field tuples
+        else:
+            chunks.put((i, scan[field_id, y, x, channel, frames])) # field_idx, field tuples
 
     # Queue STOP signal
     for i in range(num_processes):
@@ -559,4 +569,305 @@ def parallel_correlate_stack(chunks, results, raster_phase, fill_fraction, y_shi
         # Save results
 #         results.append((chunk_sum, chunk_l6norm, chunk_sum2, chunk_sqsum, chunk_xysum,field_idx))
         results.append((chunk_sum2, chunk_sqsum, chunk_xysum,field_idx))
+   
+#################################### LBM ################################################
+
+def map_LBMframes(f, scan, field_id=None, channel=None, bead_id=None, y=slice(None), x=slice(None), kwargs={},
+                chunk_size_in_GB=0.5, num_processes=10, queue_size=10):
+
+    """ Apply function f to chunks of an LBM scan. This function is different from map_frames in that
+        for LBM scans, you may need access to >1 fields/beads at a given frame. e.g. to calculate crosstalk correction. 
+        map_frames paralellizes 
+    :param function f: Function that receives two positional arguments:
+        chunks: A queue with (frames, scan_chunk) tuples. frames is a slice object,
+            scan_chunks is a [height, width, num_frames] object
+        results: A list to accumulate new results.
+    :param Scan scan: An scan object as returned by scanreader.
+    :param int channel: Which channel to read. 0-based.
+    :param int bead_id: Which bead to read. 0-based.
+        if bead_id = None, chunk will not be bead based.
+    :param slice y: How to slice the scan in y.
+    :param slice x: How to slice the scan in x.
+    :param dict kwargs: Dictionary with optional kwargs passed to f.
+    :param int chunk_size_in_GB: Desired size of each chunk.
+    :param int num_processes: Number of processes to use for mapping.
+    :param int queue_size: Maximum size of the queue used to store chunks.
+
+    :returns list results: List with results per chunk of scan. Order is not guaranteed.
+    """
+    
+    print(f"bead_id: {bead_id}")
+    
+    # Basic checks
+    if chunk_size_in_GB > 2:
+        print('Warning: Processing chunks of data bigger than 2 GB could cause timeout '
+              'errors when sending data from the master to the working processes.')
+    num_processes = min(num_processes, mp.cpu_count() - 1)
+    print('Using', num_processes, 'processes')
+
+    if isinstance(scan, np.memmap):
+        if bead_id == None:
+            bytes_per_frame = np.prod((
+                                scan.shape[0],
+                                scan.shape[1],
+                                scan.shape[2],
+                                )) * 4 # 4 bytes per pixel
+        else:
+            bytes_per_frame = np.prod((
+                                scan.shape[1],
+                                scan.shape[2],
+                                )) * 4 # 4 bytes per pixel
+    else:
+        if bead_id == None:
+            bytes_per_frame = np.prod((
+                                scan.num_lbm_beads,
+                                scan.field_widths[field_id], 
+                                scan.field_heights[field_id]
+                                )) * 4 # 4 bytes per pixel
+        else:
+            bytes_per_frame = np.prod((
+                                scan.field_widths[field_id], 
+                                scan.field_heights[field_id]
+                                )) * 4 # 4 bytes per pixel
+            
+    chunk_size = int(round((chunk_size_in_GB * 1024**3) / bytes_per_frame))
+    
+    # Create a Queue to put in new chunks and a list for results
+    manager = mp.Manager()
+    chunks = manager.Queue(maxsize=queue_size)
+    results = manager.list()
+
+    if isinstance(scan, np.memmap):
+        kwargs['mmap_obj'] = scan
         
+    # Start workers (will lock until data appears in chunks)    
+    pool = []
+    for i in range(num_processes):
+        p = mp.Process(target=f, args=(chunks, results), kwargs=kwargs)
+        p.start()
+        pool.append(p)
+
+    # Produce data
+    if isinstance(scan, np.ndarray):
+        num_frames = scan.shape[-1]
+    else:
+        num_frames = scan.num_frames
+        
+    for i in range(0, num_frames, chunk_size):
+        frames = slice(i, min(i + chunk_size, num_frames))
+        if bead_id == None: 
+            if isinstance(scan, np.memmap):
+                chunks.put((frames, scan[:, y, x, frames])) # frames, chunk tuples
+            else:
+                chunks.put((frames, scan[field_id, :, y, x, channel, frames])) # frames, chunk tuples
+        else:
+            if isinstance(scan, np.memmap):
+                chunks.put((bead_id, frames, scan[bead_id, y, x, frames])) # frames, chunk tuples
+            else:
+                chunks.put((bead_id, frames, scan[field_id, bead_id, y, x, channel, frames])) # frames, chunk tuples
+
+    # Queue STOP signal
+    if bead_id == None:
+        for i in range(num_processes):
+            chunks.put((None, None))
+    else:
+        for i in range(num_processes):
+            chunks.put((None, None, None))
+        
+    # Wait for processes to finish
+    for p in pool:
+        p.join()
+
+    return list(results)
+
+# Crosstalk Correction
+def parallel_save_crosstalk_mmap(chunks, results, correction_mat, mmap_obj):
+    """ remove crosstalk contaimination from scan and save in memory mapped file.
+
+    :param queue chunks: Queue with inputs to consume.
+    :param list results: Where to put results.
+    :param array correction_mat: matrix containing the linear combination readouts to calculate and remove ct contamination
+    :returns: Minimum value in chunk. As a side-effect it saves the memory mapped file.
+    """
+
+    while True:
+        # Read next chunk (process locks until something can be read)
+        frames, chunk = chunks.get()
+        if chunk is None:  # stop signal when all chunks have been processed
+            return
+
+        print(time.ctime(), 'Processing frames:', frames)
+
+        # Correct field
+        chunk = _crosstalk_correct_field_bead(chunk, correction_mat)
+        
+        # Save in mmap scan
+        mmap_obj[:,:,:,frames] = chunk
+        mmap_obj.flush()
+
+        # Save minimum value in results
+        results.append(chunk.min())
+
+
+def _crosstalk_correct_field_bead(chunk, correction_mat):
+    """
+    chunk: shape: (beads, Y, X, frames)
+    correction_mat: shape: (scan.num_lbm_beads, scan.num_lbm_beads) 
+    """    
+    # nan's don't play nicely with np.einsum, change them to zeros
+    correction_mat = np.nan_to_num(correction_mat, nan=0.0)
+    
+    corrected_chunk = np.einsum('ij,jklm->iklm', correction_mat, chunk)
+    
+    # print('plotting...')
+    # fig , ax = plt.subplots(2,15,figsize=(10,10))
+    # ax = ax.flatten()
+    # for idx, a in enumerate(ax):
+    #     a.imshow(corrected_chunk[idx,:,:,-1])
+    #     a.set_title(f"min: {np.nanmin(corrected_chunk[idx,:,:,-1])}, max: {np.nanmax(corrected_chunk[idx,:,:,-1])}")
+        
+    # plt.show()
+    # plt.close()
+    
+    return corrected_chunk
+
+
+# Raster Correction
+def parallel_save_raster_mmap(chunks, results, raster_phase, fill_fraction, mmap_obj):
+    """ perform raster correction and save in memory mapped file.
+
+    :param queue chunks: Queue with inputs to consume.
+    :param list results: Where to put results.
+    :param array raster_phase: 
+    :param fill_fraction: 
+    :returns: Minimum value in chunk. As a side-effect it saves the memory mapped file.
+    """
+
+    while True:
+        # Read next chunk (process locks until something can be read)
+        bead_id, frames, chunk = chunks.get()
+        if chunk is None:  # stop signal when all chunks have been processed
+            return
+
+        print(time.ctime(), 'Processing frames:', frames)
+
+        # Correct field
+        chunk = galvo_corrections.correct_raster(chunk, raster_phase, fill_fraction)
+        
+        # Save to mmap_obj
+        mmap_obj[bead_id,:,:,frames] = chunk
+        mmap_obj.flush()
+
+        # Save minimum value in results
+        results.append(chunk.min())
+        
+        
+# Motion Correction
+def parallel_motion_shifts_mmmap(chunks, results, template):
+    """ Compute motion correction shifts to chunks of scan.
+
+    Function to run in each process. Consumes input from chunks and writes results to
+    results. Stops when stop signal is received in chunks.
+
+    :param queue chunks: Queue with inputs to consume.
+    :param list results: Where to put results.
+    :param np.array template: Template used to compute motion shifts.
+
+    :returns: (frames, y_shifts, x_shifts) tuples.
+    """
+    while True:
+        # Read next chunk (process locks until something can be read)
+        frames, chunk = chunks.get()
+        if chunk is None:  # stop signal when all chunks have been processed
+            return
+
+        print(time.ctime(), 'Processing frames:', frames)
+
+        # Compute shifts
+        y_shifts, x_shifts = galvo_corrections.compute_motion_shifts(chunk, template,
+                                                                     num_threads=1)
+
+        # Add to results
+        results.append((frames, y_shifts, x_shifts))
+        
+        
+
+def parallel_save_motion_mmap(chunks, results, x_shifts, y_shifts, mmap_obj):
+    """ Apply motion correction to chunks of a scan.
+
+    Function to run in each process. Consumes input from chunks and writes results to
+    results. Stops when stop signal is received in chunks.
+
+    :param queue chunks: Queue with inputs to consume.
+    :param list results: Where to put results.
+    :param x_shifts
+    :param y_shifts
+    :param mmap_bj
+    
+    :returns: (frames, y_shifts, x_shifts) tuples.
+    """
+    while True:
+        # Read next chunk (process locks until something can be read)
+        bead_id, frames, chunk = chunks.get()
+        if chunk is None:  # stop signal when all chunks have been processed
+            return
+
+        print(time.ctime(), 'Processing frames:', frames)
+        
+        # Apply Motion Correction to this chunk of frames
+        chunk  = galvo_corrections.correct_motion(chunk, x_shifts[frames], y_shifts[frames]) # motion
+
+        # Save into mmap scan
+        mmap_obj[bead_id,:,:,frames] = chunk
+        mmap_obj.flush()
+
+
+# Summary Images
+def parallel_summary_images_lbm(chunks, results, mmap_obj):
+    """ Compute statistics used to compute correlation image and l-6 norm image.
+
+    :param queue chunks: Queue with inputs to consume.
+    :param list results: Where to put results.
+    :param float raster_phase: Raster phase used for raster correction.
+    :param float fill_fraction: Fill fraction used for raster correction.
+    :param np.array y_shifts, x_shifts: Motion shifts to correct scan.
+
+    :returns: Sum per pixel, Sum of squared values per pixel, sum of the product of each
+        pixel with its 8 neighbors and sum of values of each pixel to the 6th power.
+    """
+    while True:
+        # Read next chunk (process locks until something can be read)
+        bead_id, frames, chunk = chunks.get()
+        if chunk is None:  # stop signal when all chunks have been processed
+            return
+
+        print(time.ctime(), 'Processing frames:', frames)
+
+        # Compute sum and l6-norm
+        chunk_sum = np.sum(chunk, axis=-1, dtype=float)
+        chunk -= chunk.min()
+        chunk_l6norm = np.sum(chunk**6, axis=-1, dtype=float)
+
+        # Subtract overall brightness per frame
+        chunk -= chunk.mean(axis=(0, 1))
+
+        # Compute sum_x and sum_x^2
+        chunk_sum2 = np.sum(chunk, axis=-1, dtype=float)
+        chunk_sqsum = np.sum(chunk**2, axis=-1, dtype=float)
+
+        # Compute sum_xy: Multiply each pixel by its eight neighbors
+        chunk_xysum = np.zeros((chunk.shape[0], chunk.shape[1], 8))
+        for k in [0, 1, 2, 3]: # amount of 90 degree rotations
+            rotated_chunk = np.rot90(chunk, k=k)
+            rotated_xysum = np.rot90(chunk_xysum, k=k)
+
+            # Multiply each pixel by one above and by one above to the left
+            rotated_xysum[1:, :, k] = np.sum(rotated_chunk[1:] * rotated_chunk[:-1], axis=-1, dtype=float)
+            rotated_xysum[1:, 1:, 4 + k] = np.sum(rotated_chunk[1:, 1:] * rotated_chunk[:-1, :-1], axis=-1, dtype=float)
+
+            # Return back to original orientation
+            chunk = np.rot90(rotated_chunk, k=4 - k)
+            chunk_xysum = np.rot90(rotated_xysum, k=4 - k)
+
+        # Save results
+        results.append((chunk_sum, chunk_l6norm, chunk_sum2, chunk_sqsum, chunk_xysum))
