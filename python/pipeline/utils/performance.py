@@ -763,7 +763,7 @@ def parallel_save_raster_mmap(chunks, results, raster_phase, fill_fraction, mmap
         
         
 # Motion Correction
-def parallel_motion_shifts_mmmap(chunks, results, template):
+def parallel_motion_shifts_mmmap(chunks, results, template, mmap_obj):
     """ Compute motion correction shifts to chunks of scan.
 
     Function to run in each process. Consumes input from chunks and writes results to

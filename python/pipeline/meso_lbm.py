@@ -11,6 +11,9 @@ import itertools
 import os
 import json
 import hashlib
+import time
+from shutil import copyfile
+from scipy.signal import tukey
 
 
 from . import experiment, injection, notify, shared
@@ -33,27 +36,7 @@ logger = logging.getLogger(__name__)
 schema = dj.schema(f"{dj.config['database.user']}_meso_lbm_dev", locals(), create_tables=True)
 CURRENT_VERSION = 3
 
-def hash_dictionary(d):
-    
-    # Convert NumPy int64 values to Python int
-    for key, value in d.items():
-        if isinstance(value, np.int64):
-            d[key] = int(value)
-            
-    # Serialize the dictionary into a JSON string with sorted keys
-    serialized_dict = json.dumps(d, sort_keys=True)
-    
-    # Create a SHA-256 hash object
-    hash_obj = hashlib.sha256()
-    
-    # Update the hash object with the serialized dictionary string
-    hash_obj.update(serialized_dict.encode('utf-8'))
-    
-    # Get the hexadecimal digest of the hash
-    hash_hex = hash_obj.hexdigest()
-    
-    return hash_hex
-    
+   
 def build_mmap_filename(key, keys_for_hash, end_tag, dir='/mnt/lbmscratch1/mmap_files/'):
     
     # Make sure key contains all required information
@@ -63,11 +46,12 @@ def build_mmap_filename(key, keys_for_hash, end_tag, dir='/mnt/lbmscratch1/mmap_
     num_frames, num_beads = (ScanInfo() & key).fetch1("nframes", "nbeads")
     mmap_shape = (num_beads, image_height, image_width, num_frames)
     dict_for_hash = {d: key[d] for d in keys_for_hash if d in key}
-    hashed_key = hash_dictionary(dict_for_hash)
+    hashed_key = key_hash(dict_for_hash)
     mmap_file_name = f"{dir}lbm_{hashed_key}{end_tag}.mmap"
 
     return mmap_file_name, mmap_shape
     
+
     
 @schema
 class Version(dj.Manual):
@@ -218,14 +202,15 @@ class ScanInfo(dj.Imported):
             
             self.insert1(tuple_)
     
-    def rawscan_mmap(self, key, force_recalculate=False):
+    def rawscan_mmap(self, key, force_recalculate=False, frames_per_chunk=2560):
         """ Check if the rawscan mmap file/object already exists. Create, if it doesn't exist."""
         print(f"Processing: rawscan_mmap for:  {key}")
-
-        # Open scan
         scan_filename = (experiment.Scan() & key).local_filenames_as_wildcard
         scan = scanreader.read_scan(scan_filename, scan_key=key)
-            
+        
+        nbeads  = (ScanInfo & key).fetch1('nbeads')
+        nframes = (ScanInfo & key).fetch1('nframes')
+        
         rawscan_mmap_name_initital, mmap_shape = build_mmap_filename(
                                                             key, 
                                                             keys_for_hash = ['animal_id', 'session', 'scan_idx', 'field'], 
@@ -241,11 +226,14 @@ class ScanInfo(dj.Imported):
         reason = 'forced recreate' if force_recalculate else 'rawscan_mmap not found'
         print(f"   Creating: Reason - {reason}")
         rawscan_mmap_file_initial = np.memmap(rawscan_mmap_name_initital, mode="w+", shape=mmap_shape, dtype=np.float32)
-
-
-        # Apply the crosstalk correction to the mmap object - TODO: Optimize?
-        for bead_idx in tqdm(np.arange(scan.num_lbm_beads)):
-            rawscan_mmap_file_initial[bead_idx,:,:,:]  = scan[key['field']-1,bead_idx,:,:,0,:]
+        
+        # Fill mmap with scan contents
+        num_chunks = int(np.ceil(nframes / frames_per_chunk))
+        for bead in range(nbeads):
+            for i in range(num_chunks):
+                start = i * frames_per_chunk
+                end = min((i + 1) * frames_per_chunk, nframes)
+                rawscan_mmap_file_initial[bead,:,:,start:end] = scan[key['field']-1, bead, :, :, 0, start:end]
             rawscan_mmap_file_initial.flush()
 
         # Rename from 'init' to 'complete'
@@ -261,7 +249,16 @@ class PageCount(dj.Manual):
     npages       : int      # amt pages in all tiffs associated with a scan
     """
 
-  
+@schema
+class PageCountTiffs(dj.Manual):
+    definition = """ # cache the num_pages in scan tiffs to speed up opening scanreader object
+    
+    -> experiment.Scan
+    file_name    : varchar(255) # pages within this tiff file
+    ---
+    npages       : int      # amt pages in all tiffs associated with a scan
+    """
+    
 @schema
 class CorrectionChannel(dj.Manual):
     definition = """ # channel to use for raster and motion correction
@@ -315,13 +312,18 @@ class CrossTalkCorrection(dj.Computed):
 
         key_ = key.copy()
         frame_means = []
+        
+        # Take average of middle 2000 frames of scan TODO: Evaluate further if this is a good assumption
+        middle_frame = scan.num_frames // 2
+        frames = slice(max(middle_frame - 1000, 0), middle_frame + 1000)
+        
         for field in tqdm(np.arange(scan.num_fields)):
             key_['field'] = field+1
-            mmap = ScanInfo().rawscan_mmap(key_)
-            mmap_mean_frame = np.mean(mmap, -1)
+            rawscan_mmap = ScanInfo().rawscan_mmap(key_)
+            mmap_mean_frame = np.mean(rawscan_mmap[:,:,:,frames], -1)
             frame_means.append(mmap_mean_frame)
         frame_means_array = np.asarray(frame_means)
-            
+        
         crosstalkCorrectionResults, pre_images, post_images = scanreader.utils_lbm.calculate_crosstalk(scan, key['crosstalk_method'], frame_means_array)
     
         tup_ = key.copy()
@@ -356,7 +358,8 @@ class CrossTalkCorrection(dj.Computed):
         # Open scan
         scan_filename = (experiment.Scan() & key).local_filenames_as_wildcard
         scan = scanreader.read_scan(scan_filename, scan_key=key)
-            
+        nbeads  = (ScanInfo & key).fetch1('nbeads')
+        
         # Build name of mmap file(s). This doesn't actually create the files
         crosstalk_mmap_name_initital, mmap_shape = build_mmap_filename(
                                                 key, 
@@ -381,7 +384,7 @@ class CrossTalkCorrection(dj.Computed):
         f = performance.parallel_save_crosstalk_mmap  # function to map
         crosstalk_correction_mat = (CrossTalkCorrection() & key).fetch1('crosstalk_correction_mat')
         kwargs = {  
-                    "correction_mat" : crosstalk_correction_mat[:scan.num_lbm_beads, :scan.num_lbm_beads], 
+                    "correction_mat" : crosstalk_correction_mat[:nbeads, :nbeads], 
                     "mmap_obj" : crosstalk_mmap_file_initial,
                     }
         results = performance.map_LBMframes(
@@ -392,9 +395,6 @@ class CrossTalkCorrection(dj.Computed):
                                             kwargs=kwargs
                                             )
         
-        
-        # Reduce: Use the minimum values to make memory mapped scan nonnegative
-        # crosstalk_mmap_file_initial -= np.min(results)
         crosstalk_mmap_file_initial.flush()
         
         
@@ -422,47 +422,37 @@ class RasterCorrection(dj.Computed):
 
 
     def make(self, key, save_mmap=False):
-        from scipy.signal import tukey
 
         # Read the scan
         scan_filename = (experiment.Scan() & key).local_filenames_as_wildcard
         scan = scanreader.read_scan(scan_filename, dtype=np.float32, scan_key=key)
-
-        # Find or calculate crosstalk corrected mmap of field
-        # scan_mmap is of shape (num_beads, Y, X, num_frames). Channel is not included. TODO: change this?
-        scan_mmap = CrossTalkCorrection().crosstalk_correction_mmap(key)
         
-        # Select correction channel
-        channel = (CorrectionChannel() & key).fetch1("channel") - 1
-        field_id = key["field"] - 1
-        bead_id = key["bead"] - 1
-
+        nframes = (ScanInfo & key).fetch1('nframes')
+        
+        # Get the crosstalk_mmap
+        crosstalk_mmap = CrossTalkCorrection().crosstalk_correction_mmap(key)
+        
         # Load some frames from the middle of the scan
-        middle_frame = int(np.floor(scan.num_frames / 2))
+        middle_frame = nframes // 2
         frames = slice(max(middle_frame - 1000, 0), middle_frame + 1000)
-        mini_scan = scan_mmap[bead_id, :, :, frames]
+        mini_scan = crosstalk_mmap[key["bead"]-1, :, :, frames]
 
         # Create results tuple
         tuple_ = key.copy()
 
         # Create template (average frame tapered to avoid edge artifacts)
         taper = np.sqrt(
-            np.outer(
-                tukey(scan.field_heights[field_id], 0.4),
-                tukey(scan.field_widths[field_id], 0.4),
-                )
-                        )
-        anscombed = 2 * np.sqrt(
-                                mini_scan - mini_scan.min() + 3 / 8
-                                )  # anscombe transform
+                        np.outer(
+                            tukey((ScanInfo.Field() & key).fetch1('px_height'), 0.4),
+                            tukey((ScanInfo.Field() & key).fetch1('px_width'), 0.4),
+                            ))
+        anscombed = 2 * np.sqrt(mini_scan - mini_scan.min() + 3 / 8)  # anscombe transform
         template = np.mean(anscombed, axis=-1) * taper
         tuple_["raster_template"] = template
 
         # Compute raster correction parameters
         if scan.is_bidirectional:
-            tuple_["raster_phase"] = galvo_corrections.compute_raster_phase(
-                template, scan.temporal_fill_fraction
-            )
+            tuple_["raster_phase"] = galvo_corrections.compute_raster_phase(template, scan.temporal_fill_fraction)
         else:
             tuple_["raster_phase"] = 0
 
@@ -473,7 +463,6 @@ class RasterCorrection(dj.Computed):
         MotionMethodForScan().fill(key)
         
         if save_mmap == True:
-            # Build key required for creating the raster_correction_mmap
             tuple_['channel'] = (CorrectionChannel() & key).fetch1("channel") - 1
             raster_mmap = self.raster_correction_mmap(tuple_, scan)
 
@@ -493,18 +482,11 @@ class RasterCorrection(dj.Computed):
     def raster_correction_mmap(self, key, force_recalculate=False, delete_prev_mmap=True):
         print(f"processing: raster_mmap for: {key}")
         
-        
-        # Open scan
-        # scan_filename = (experiment.Scan() & key).local_filenames_as_wildcard
-        # scan = scanreader.read_scan(scan_filename, scan_key=key)
-        
-        
         # Build name of mmap file(s). This doesn't actually create the files
         raster_mmap_name_initital, mmap_shape = build_mmap_filename(
                                                 key, 
                                                 keys_for_hash = ['animal_id', 'session', 'scan_idx', 'field', 'crosstalk_method', 'channel'], 
                                                 end_tag = '_raster_init')
-        
         
         # Does mmap already exist?
         raster_mmap_name_complete = raster_mmap_name_initital.replace('init', 'complete')
@@ -512,17 +494,14 @@ class RasterCorrection(dj.Computed):
             print(f"   Found raster_mmap - Returning")
             return np.memmap(raster_mmap_name_complete, mode="r", shape=mmap_shape, dtype=np.float32)
         
-
         # If mmap doesn't exist, create
         reason = 'forced recalculate' if force_recalculate else 'raster_mmap not found'
         print(f"   Creating: Reason - {reason}")
         
-        
-        # Write crosstalk_mmap_file_complete into raster_mmap_file_initial
+        # Create raster_mmap_initial by making a copy of previous mmap (crosstalk_correction_mmap)
         crosstalk_mmap_file_complete = CrossTalkCorrection().crosstalk_correction_mmap(key)
-        raster_mmap_file_initial = np.memmap(raster_mmap_name_initital, dtype=np.float32, mode='w+', shape=mmap_shape)
-        raster_mmap_file_initial[:] = crosstalk_mmap_file_complete
-        raster_mmap_file_initial.flush()        
+        copyfile(crosstalk_mmap_file_complete.filename, raster_mmap_name_initital)
+        raster_mmap_file_initial = np.memmap(raster_mmap_name_initital, dtype=np.float32, mode='r+', shape=mmap_shape)
         
         # Apply raster correction to raster_mmap_file_initial
         for bead_id in np.arange((ScanInfo & key).fetch1('nbeads')):
@@ -533,11 +512,8 @@ class RasterCorrection(dj.Computed):
                         
             if abs(raster_phase) > 1e-7:
                 f = performance.parallel_save_raster_mmap
-                kwargs = {
-                            "raster_phase": raster_phase,
-                            "fill_fraction": fill_fraction,
-                            }
-
+                kwargs = {  "raster_phase": raster_phase,
+                            "fill_fraction": fill_fraction,}
                 results = performance.map_LBMframes(
                                                     f,
                                                     raster_mmap_file_initial,
@@ -550,7 +526,7 @@ class RasterCorrection(dj.Computed):
         raster_mmap_file_initial.flush()
         
         
-        # Now that the raster_mmap is completed, delete the crosstalk mmap
+        # Now that the raster_mmap is completed, delete the crosstalk mmap (highly recommended!)
         if delete_prev_mmap:
             os.remove(crosstalk_mmap_file_complete.filename)
 
@@ -558,7 +534,7 @@ class RasterCorrection(dj.Computed):
         os.rename(raster_mmap_file_initial.filename, raster_mmap_name_complete)    
         return np.memmap(raster_mmap_name_complete, mode='r', shape=mmap_shape, dtype=np.float32)
 
- 
+
 @schema
 class MotionMethodForScan(dj.Manual):
     definition = """ # defines which motion correction method to use
@@ -621,20 +597,12 @@ class MotionCorrection(dj.Computed):
                 
         num_frames, num_fields = (ScanInfo & key).fetch1("nframes", "nfields")
         
-        # Get raster_mmap
-        motion_mmap_name_initital, mmap_shape = build_mmap_filename(
-                                                key, 
-                                                keys_for_hash = ['animal_id', 'session', 'scan_idx', 'field', 
-                                                                 'crosstalk_method', 'channel', 'motion_correction_method'], 
-                                                end_tag = '_motion_init')
-        raster_mmap_file_complete = RasterCorrection().raster_correction_mmap(key)
-        motion_mmap_file_initial = np.memmap(motion_mmap_name_initital, dtype=np.float32, mode='w+', shape=mmap_shape)
-        motion_mmap_file_initial[:] = raster_mmap_file_complete
-        motion_mmap_file_initial.flush()
-        del raster_mmap_file_complete
+        # Get a single bead from the raster_mmap
+        raster_mmap_file = RasterCorrection().raster_correction_mmap(key)
 
-
-        scan = motion_mmap_file_initial[key["bead"]-1, :, :, :]
+        print(f"Extracting single beadfrom raster_mmap")
+        scan = raster_mmap_file[key["bead"]-1, :, :, :]
+        del raster_mmap_file
         scan = scan[np.newaxis, :, :, np.newaxis, :]
         template = galvo_corrections.create_template(scan, key)
 
@@ -642,7 +610,6 @@ class MotionCorrection(dj.Computed):
         if key["motion_correction_method"] in (1,2,3,):
             pass
         elif key["motion_correction_method"] in (4,5,6,7,8,9,10,11,12,):
-
             fps = (ScanInfo & key).fetch1("fps")
             window_size = np.max((int(fps / 3), 3))
             scan = ndimage.convolve1d(
@@ -653,26 +620,18 @@ class MotionCorrection(dj.Computed):
 
         # Map: compute motion shifts in parallel
         f = performance.parallel_motion_shifts_mmmap  # function to map
-        raster_phase = (RasterCorrection() & key).fetch1("raster_phase")
-        fill_fraction = (ScanInfo() & key).fetch1("fill_fraction")
-        kwargs = {
-            # "raster_phase": raster_phase,
-            # "fill_fraction": fill_fraction,
-            "template": template,
-        }
+        kwargs = {"template": template,}
 
         # Determine border cutoff to avoid edge artifacts
         px_height, px_width = (ScanInfo.Field & key).fetch1("px_height", "px_width")
         skip_rows = int(round(px_height * 0.10))
         skip_cols = int(round(px_width * 0.10))
 
-        # Determine xy shifts via phase correlation. Field ID and channel are using dummy values
-        # as the scan has already been cropped to the field and channel of interest above. This
-        # was done to reduce memory usage.
-        results = performance.map_frames(
+        # Determine xy shifts via phase correlation.
+        results = performance.map_LBMframes(
             f,
             scan,
-            field_id=0,
+            field_id = 0,
             y=slice(skip_rows, -skip_rows),
             x=slice(skip_cols, -skip_cols),
             channel=0,
@@ -1047,7 +1006,6 @@ class MotionCorrection(dj.Computed):
     def motion_correction_mmap(self, key, force_recalculate=False, delete_prev_mmap=True):
         print(f"processing: motion_mmap_complete for: {key}")
         
-        
         # Add motion_correction_method and channel to key
         if len(MotionMethodForScan & key) == 0:
             raise PipelineException(
@@ -1060,7 +1018,8 @@ class MotionCorrection(dj.Computed):
         motion_mmap_name_initital, mmap_shape = build_mmap_filename(
                                                 key, 
                                                 keys_for_hash = ['animal_id', 'session', 'scan_idx', 
-                                                                 'field', 'crosstalk_method', 'channel', 'motion_correction_method'], 
+                                                                 'field', 'crosstalk_method', 'channel', 
+                                                                 'motion_correction_method'], 
                                                 end_tag = '_motion_init')
         
         
@@ -1075,21 +1034,19 @@ class MotionCorrection(dj.Computed):
         reason = 'forced' if force_recalculate else 'not found'
         print(f"   Recalculating - {reason}")
         
-        
-        # Write raster_mmap_file_complete into motion_mmap_file_initial
-        print(f"   Creating motion_mmap_file")
+
+        # Create motion_mmap_initial by making a copy of previous mmap (raster_correction_mmap)
         raster_mmap_file_complete = RasterCorrection().raster_correction_mmap(key)
-        motion_mmap_file_initial = np.memmap(motion_mmap_name_initital, dtype=np.float32, mode='w+', shape=mmap_shape)
-        motion_mmap_file_initial[:] = raster_mmap_file_complete
-        motion_mmap_file_initial.flush()
+        copyfile(raster_mmap_file_complete.filename, motion_mmap_name_initital)
+        motion_mmap_file_initial = np.memmap(motion_mmap_name_initital, dtype=np.float32, mode='r+', shape=mmap_shape)
         
         
         # Apply motion correction to motion_mmap_file_initial
         print(f"   Writing to motion_mmap_file")
-        for bead_id in np.arange((ScanInfo & key).fetch1('nbeads')):
+        f = performance.parallel_save_motion_mmap
+        for bead_id in range((ScanInfo & key).fetch1('nbeads')):
             key['bead'] = bead_id+1
             y_shifts, x_shifts = (MotionCorrection() & key).fetch1("y_shifts", "x_shifts")
-            f = performance.parallel_save_motion_mmap
             kwargs = {  'x_shifts': x_shifts,
                         'y_shifts': y_shifts}
             results = performance.map_LBMframes(
@@ -1103,7 +1060,7 @@ class MotionCorrection(dj.Computed):
 
         motion_mmap_file_initial.flush()
         
-        # Now that the motion_mmap is completed, delete the raster_mmap
+        # Now that the motion_mmap is completed, delete the raster_mmap (highly recommended!)
         if delete_prev_mmap:
             os.remove(raster_mmap_file_complete.filename)
         
@@ -1149,14 +1106,16 @@ class SummaryImages(dj.Computed):
 
     def make(self, key):
         # Read the scan
-        scan_filename = (experiment.Scan() & key).local_filenames_as_wildcard
-        scan = scanreader.read_scan(scan_filename, scan_key=key)
 
+        nchannels, nframes = (ScanInfo & key).fetch1("nchannels", "nframes")
+        
+        
+        # Get the motion_mmap
         motion_mmap = MotionCorrection().motion_correction_mmap(key)
         
-        for channel in range(scan.num_channels):
+        for channel in range(nchannels):
             # Map: Compute some statistics in different chunks of the scan
-            f = performance.parallel_summary_images_lbm  # function to map
+            f = performance.parallel_summary_images_lbm 
             kwargs = {}
             results = performance.map_LBMframes(
                 f, 
@@ -1168,14 +1127,14 @@ class SummaryImages(dj.Computed):
             )
 
             # Reduce: Compute average images
-            average_image = np.sum([r[0] for r in results], axis=0) / scan.num_frames
+            average_image = np.sum([r[0] for r in results], axis=0) / nframes
             l6norm_image = np.sum([r[1] for r in results], axis=0) ** (1 / 6)
 
             # Reduce: Compute correlation image
             sum_x = np.sum([r[2] for r in results], axis=0)  # h x w
             sum_sqx = np.sum([r[3] for r in results], axis=0)  # h x w
             sum_xy = np.sum([r[4] for r in results], axis=0)  # h x w x 8
-            denom_factor = np.sqrt(scan.num_frames * sum_sqx - sum_x ** 2)
+            denom_factor = np.sqrt(nframes * sum_sqx - sum_x ** 2)
             corrs = np.zeros(sum_xy.shape)
             for k in [0, 1, 2, 3]:
                 rotated_corrs = np.rot90(corrs, k=k)
@@ -1185,11 +1144,11 @@ class SummaryImages(dj.Computed):
 
                 # Compute correlation
                 rotated_corrs[1:, :, k] = (
-                    scan.num_frames * rotated_sum_xy[1:, :, k]
+                    nframes * rotated_sum_xy[1:, :, k]
                     - rotated_sum_x[1:] * rotated_sum_x[:-1]
                 ) / (rotated_dfactor[1:] * rotated_dfactor[:-1])
                 rotated_corrs[1:, 1:, 4 + k] = (
-                    scan.num_frames * rotated_sum_xy[1:, 1:, 4 + k]
+                    nframes * rotated_sum_xy[1:, 1:, 4 + k]
                     - rotated_sum_x[1:, 1:] * rotated_sum_x[:-1, :-1]
                 ) / (rotated_dfactor[1:, 1:] * rotated_dfactor[:-1, :-1])
 
@@ -1207,11 +1166,9 @@ class SummaryImages(dj.Computed):
             self.insert1(field_key, ignore_extra_fields=True)
             self.Average().insert1({**field_key, "average_image": average_image}, ignore_extra_fields=True)
             self.L6Norm().insert1({**field_key, "l6norm_image": l6norm_image}, ignore_extra_fields=True)
-            self.Correlation().insert1(
-                {**field_key, "correlation_image": correlation_image}
-            , ignore_extra_fields=True)
+            self.Correlation().insert1({**field_key, "correlation_image": correlation_image}, ignore_extra_fields=True)
 
-        self.notify(key, scan.num_channels)
+        self.notify(key, nchannels)
 
     @notify.ignore_exceptions
     def notify(self, key, num_channels):
@@ -1396,15 +1353,8 @@ class Segmentation(dj.Computed):
             field_id = key["field"] - 1
             channel = key["channel"] - 1
             bead = key["bead"] - 1
-            image_height, image_width = (ScanInfo.Field() & key).fetch1(
-                "px_height", "px_width"
-            )
+            image_height, image_width = (ScanInfo.Field() & key).fetch1("px_height", "px_width")
             num_frames = (ScanInfo() & key).fetch1("nframes")
-
-            # Read scan
-            print("Reading scan...")
-            scan_filename = (experiment.Scan() & key).local_filenames_as_wildcard
-            scan = scanreader.read_scan(scan_filename, scan_key=key)
             
             # Load in motion_mmap
             motion_mmap = MotionCorrection().motion_correction_mmap(key)
@@ -1420,16 +1370,12 @@ class Segmentation(dj.Computed):
             segmentation_mmap = np.memmap(filename, mode="w+", shape=segmentation_mmap_shape, dtype=np.float32)
             
             # Load (and reshape) relevant section of motion_mmap into segmentation_mmap     
-            segmentation_mmap[:] = motion_mmap[bead,:,:,:].reshape(-1, motion_mmap.shape[-1])
+            segmentation_mmap[:] = motion_mmap[bead,:,:,:].reshape(-1, num_frames)
+            
+            # Reduce: Use the minimum values to make memory mapped scan nonnegative
+            segmentation_mmap -= np.min(segmentation_mmap)  # bit inefficient but necessary
             segmentation_mmap.flush()
-            
-            
-            # TODO: WHAT IS THIS DOING. DO I NEED IT?
-            # # Reduce: Use the minimum values to make memory mapped scan nonnegative
-            # mmap_scan -= np.min(results)  # bit inefficient but necessary
-            # TODO: WHAT IS THIS DOING. DO I NEED IT?
-            
-            
+
             # Set CNMF parameters
             ## Set general parameters
             kwargs = {}
@@ -1502,10 +1448,7 @@ class Segmentation(dj.Computed):
 
             # Extract traces
             print("Extracting masks and traces (cnmf)...")
-            scan_ = segmentation_mmap.reshape(
-                (image_height, image_width, num_frames), order="F"
-            )
-            
+            scan_ = segmentation_mmap.reshape((image_height, image_width, num_frames), order="F")
             cnmf_result = cmn.extract_masks(scan_, segmentation_mmap, **kwargs)
             (
                 masks,
@@ -1526,41 +1469,37 @@ class Segmentation(dj.Computed):
             ## Insert in CNMF, Segmentation and Fluorescence
             self.insert1({**key, "params": json.dumps(kwargs)}, ignore_extra_fields=True)
             Fluorescence().insert1(
-                key, allow_direct_insert=True, 
+                key, 
+                allow_direct_insert=True, 
                 ignore_extra_fields=True
             )  # we also insert traces
 
             ## Insert background components
             Segmentation.CNMFBackground().insert1(
-                {**key, "masks": background_masks, "activity": background_traces}
-            , ignore_extra_fields=True)
+                {**key, "masks": background_masks, "activity": background_traces}, 
+                ignore_extra_fields=True)
 
             ## Insert masks and traces (masks in Matlab format)
             num_masks = masks.shape[-1]
             if num_masks > 0:
                 num_masks = masks.shape[-1]
-                masks = masks.reshape(
-                    -1, num_masks, order="F"
-                ).T  # [num_masks x num_pixels] in F order
+                masks = masks.reshape(-1, num_masks, order="F").T  # [num_masks x num_pixels] in F order
                 raw_traces = raw_traces.astype(np.float32, copy=False)
                 for mask_id, mask, trace in zip(range(1, num_masks + 1), masks, raw_traces):
                     mask_pixels = np.where(mask)[0]
                     mask_weights = mask[mask_pixels]
                     mask_pixels += 1  # matlab indices start at 1
-                    Segmentation.Mask().insert1(
-                        {
-                            **key,
-                            "mask_id": mask_id,
-                            "pixels": mask_pixels,
-                            "weights": mask_weights,
-                        }
-                    , ignore_extra_fields=True)
+                    Segmentation.Mask().insert1({
+                                                **key,
+                                                "mask_id": mask_id,
+                                                "pixels": mask_pixels,
+                                                "weights": mask_weights,}
+                                                , ignore_extra_fields=True)
 
                     Fluorescence.Trace().insert1(
                         {**key, "mask_id": mask_id, "trace": trace},
                         allow_direct_insert=True,
-                        ignore_extra_fields=True
-                    )
+                        ignore_extra_fields=True)
 
             Segmentation().notify(key)
 
@@ -2556,7 +2495,7 @@ class AreaMembership(dj.Computed):
         self.UnitInfo.insert(np.concatenate(unit_tups), ignore_extra_fields=True)
 '''
 
-'''Func2StructMatching
+''' Func2StructMatching
 @schema
 class Func2StructMatching(dj.Computed):
     definition = """ # match functional masks to structural masks
@@ -2807,7 +2746,7 @@ class ProximityCellMatch(dj.Computed):
         self.insert1(key, ignore_extra_fields=True)
 '''
 
-'''BestProximityCellMatch
+''' BestProximityCellMatch
 @schema
 class BestProximityCellMatch(dj.Computed):
     """
