@@ -431,7 +431,7 @@ def create_template(scan, key):
     """
 
     ## Get needed info
-    pipe = _get_pipe(key)
+    # pipe = _get_pipe(key)
     px_height, px_width, _, _ = _get_field_size_info(key)
     skip_rows = int(
         round(px_height * 0.10)

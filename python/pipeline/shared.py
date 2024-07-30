@@ -2,7 +2,8 @@
 
 import datajoint as dj
 import numpy as np
-from scipy.signal import hamming, convolve, medfilt
+from scipy.signal import convolve, medfilt
+from scipy.signal.windows import hamming
 from .exceptions import PipelineException
 
 schema = dj.schema('pipeline_shared', locals(), create_tables=False)

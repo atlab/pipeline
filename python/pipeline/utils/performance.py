@@ -573,7 +573,7 @@ def parallel_correlate_stack(chunks, results, raster_phase, fill_fraction, y_shi
 #################################### LBM ################################################
 
 def map_LBMframes(f, scan, field_id=None, channel=None, bead_id=None, y=slice(None), x=slice(None), kwargs={},
-                chunk_size_in_GB=0.5, num_processes=10, queue_size=10):
+                chunk_size_in_GB=0.01, num_processes=1, queue_size=1):
 
     """ Apply function f to chunks of an LBM scan. This function is different from map_frames in that
         for LBM scans, you may need access to >1 fields/beads at a given frame. e.g. to calculate crosstalk correction. 
