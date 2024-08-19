@@ -83,7 +83,7 @@ def compute_motion_shifts(scan, template, in_place=True, num_threads=8):
 
     # Get some params
     image_height, image_width, num_frames = scan.shape
-    taper = np.outer(signal.tukey(image_height, 0.2), signal.tukey(image_width, 0.2))
+    taper = np.outer(signal.windows.tukey(image_height, 0.2), signal.windows.tukey(image_width, 0.2))
 
     # Prepare fftw
     frame = pyfftw.empty_aligned((image_height, image_width), dtype='complex64')

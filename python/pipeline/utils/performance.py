@@ -573,7 +573,7 @@ def parallel_correlate_stack(chunks, results, raster_phase, fill_fraction, y_shi
 #################################### LBM ################################################
 
 def map_LBMframes(f, scan, field_id=None, channel=None, bead_id=None, y=slice(None), x=slice(None), kwargs={},
-                chunk_size_in_GB=0.01, num_processes=1, queue_size=1):
+                chunk_size_in_GB=0.5, num_processes=1, queue_size=1):
 
     """ Apply function f to chunks of an LBM scan. This function is different from map_frames in that
         for LBM scans, you may need access to >1 fields/beads at a given frame. e.g. to calculate crosstalk correction. 
@@ -595,9 +595,7 @@ def map_LBMframes(f, scan, field_id=None, channel=None, bead_id=None, y=slice(No
 
     :returns list results: List with results per chunk of scan. Order is not guaranteed.
     """
-    
-    print(f"bead_id: {bead_id}")
-    
+        
     # Basic checks
     if chunk_size_in_GB > 2:
         print('Warning: Processing chunks of data bigger than 2 GB could cause timeout '
@@ -605,33 +603,10 @@ def map_LBMframes(f, scan, field_id=None, channel=None, bead_id=None, y=slice(No
     num_processes = min(num_processes, mp.cpu_count() - 1)
     print('Using', num_processes, 'processes')
 
-    if isinstance(scan, np.memmap):
-        if bead_id == None:
-            bytes_per_frame = np.prod((
-                                scan.shape[0],
-                                scan.shape[1],
-                                scan.shape[2],
-                                )) * 4 # 4 bytes per pixel
-        else:
-            bytes_per_frame = np.prod((
-                                scan.shape[1],
-                                scan.shape[2],
-                                )) * 4 # 4 bytes per pixel
-    else:
-        if bead_id == None:
-            bytes_per_frame = np.prod((
-                                scan.num_lbm_beads,
-                                scan.field_widths[field_id], 
-                                scan.field_heights[field_id]
-                                )) * 4 # 4 bytes per pixel
-        else:
-            bytes_per_frame = np.prod((
-                                scan.field_widths[field_id], 
-                                scan.field_heights[field_id]
-                                )) * 4 # 4 bytes per pixel
+    bytes_per_frame = np.prod((scan.shape[0], scan.shape[1])) * 4 # 4 bytes per pixel
             
     chunk_size = int(round((chunk_size_in_GB * 1024**3) / bytes_per_frame))
-    
+
     # Create a Queue to put in new chunks and a list for results
     manager = mp.Manager()
     chunks = manager.Queue(maxsize=queue_size)
@@ -648,31 +623,15 @@ def map_LBMframes(f, scan, field_id=None, channel=None, bead_id=None, y=slice(No
         pool.append(p)
 
     # Produce data
-    if isinstance(scan, np.ndarray):
-        num_frames = scan.shape[-1]
-    else:
-        num_frames = scan.num_frames
-        
+    num_frames = scan.shape[-1]
+
     for i in range(0, num_frames, chunk_size):
         frames = slice(i, min(i + chunk_size, num_frames))
-        if bead_id == None: 
-            if isinstance(scan, np.memmap):
-                chunks.put((frames, scan[:, y, x, frames])) # frames, chunk tuples
-            else:
-                chunks.put((frames, scan[field_id, :, y, x, channel, frames])) # frames, chunk tuples
-        else:
-            if isinstance(scan, np.memmap):
-                chunks.put((bead_id, frames, scan[bead_id, y, x, frames])) # frames, chunk tuples
-            else:
-                chunks.put((bead_id, frames, scan[field_id, bead_id, y, x, channel, frames])) # frames, chunk tuples
+        chunks.put((frames, scan[y, x, frames])) # frames, chunk tuples
 
     # Queue STOP signal
-    if bead_id == None:
-        for i in range(num_processes):
-            chunks.put((None, None))
-    else:
-        for i in range(num_processes):
-            chunks.put((None, None, None))
+    for i in range(num_processes):
+        chunks.put((None, None))
         
     # Wait for processes to finish
     for p in pool:
@@ -837,7 +796,7 @@ def parallel_summary_images_lbm(chunks, results, mmap_obj):
     """
     while True:
         # Read next chunk (process locks until something can be read)
-        bead_id, frames, chunk = chunks.get()
+        frames, chunk = chunks.get()
         if chunk is None:  # stop signal when all chunks have been processed
             return
 
