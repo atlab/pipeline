@@ -1,0 +1,90 @@
+FROM ubuntu:22.04
+
+LABEL maintainer="Maxwell Gagnon <maxgagnon@pm.me>"
+ARG DEBIAN_FRONTEND=noninteractive
+
+###############################################################################
+# Install system dependencies including Python 3.9
+
+RUN apt-get update && apt-get install -y software-properties-common
+RUN add-apt-repository ppa:deadsnakes/ppa
+RUN apt-get update && apt-get install -y python3.9 python3.9-dev python3.9-distutils
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.9 1
+
+
+RUN apt-get update && \
+    apt-get install -y \
+        # python3.9 \
+        # python3-dev \
+        python3-pip \
+        # python3-distutils \
+        python3-venv \
+        python3-git \
+        python3-tk \
+        git \
+        tar \
+        zlib1g-dev \
+        wget \
+        nano \
+        vim \
+        graphviz \
+        ffmpeg
+
+# Create and activate a virtual environment
+# RUN python3.10 -m venv /opt/venv
+# ENV PATH="/opt/venv/bin:$PATH"
+
+# # Upgrade pip within the virtual environment
+RUN pip install --upgrade pip
+
+# ###############################################################################
+# # Install Python packages
+RUN pip install scipy matplotlib future cvxpy scikit-learn scikit-image \
+    peakutils ipyparallel Cython h5py tqdm psutil seaborn slacker imreg_dft \
+    pandas imageio nose2 jupyterlab suite2p numpy ipywidgets 
+    
+# Install Caiman requirements
+RUN pip install pims pynwb tifffile tk holoviews tensorflow tensorflow-addons
+
+
+# ###############################################################################
+# Install packages from GitHub
+RUN pip install git+https://github.com/flatironinstitute/CaImAn.git@v1.9.16
+RUN pip install git+https://github.com/ZhuokunDing/datajoint-python.git
+RUN pip install git+https://github.com/maxwellgagnon/scanreader.git
+RUN pip install git+https://github.com/cajal/bl3d.git
+RUN pip install git+https://github.com/atlab/commons.git#egg=commons&subdirectory=python
+RUN pip install git+https://github.com/PythonCharmers/python-future.git
+
+ENTRYPOINT ["/bin/bash"]
+
+
+
+# FROM nvidia/cuda:12.3.2-devel-ubuntu20.04
+# ENV DEBIAN_FRONTEND=noninteractive
+
+# # Install software-properties-common and Python 3.9
+# RUN apt-get update && apt-get install -y software-properties-common
+# RUN add-apt-repository ppa:deadsnakes/ppa
+# RUN apt-get update && apt-get install -y python3.9 python3.9-dev python3.9-distutils
+# RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.9 1
+
+# # Re-link CUDA libraries (if necessary)
+# ENV PATH /usr/local/nvidia/bin:/usr/local/cuda/bin:${PATH}
+# ENV LD_LIBRARY_PATH /usr/local/nvidia/lib:/usr/local/nvidia/lib64
+
+# # Install pip and packages
+# RUN apt-get install -y python3-pip
+# RUN python3.9 -m pip install --upgrade pip
+# RUN pip install opencv-python ipywidgets jupyterlab -U deeplake easydict setuptools==59.8.0
+# RUN apt-get install -y git libgl1-mesa-glx libglib2.0-0 libsm6 libxext6 libxrender-dev
+# RUN pip install torch torchvision matplotlib seaborn scikit-learn scipy faiss-gpu
+
+# RUN git clone -b model_builder https://github.com/sinzlab/nnvision.git && pip install -e ./nnvision
+# # RUN git clone -b new_lightning https://github.com/KonstantinWilleke/t-simcne.git && pip install -e ./t-simcne
+# # RUN pip install git+https://github.com/cajal/featurevis.git
+
+# WORKDIR /project
+# EXPOSE 8888
+
+# CMD ["jupyter", "lab", "--ip=0.0.0.0", "--port=8888", "--no-browser", "--allow-root", "--NotebookApp.token=''", "--notebook-dir=/project"]
