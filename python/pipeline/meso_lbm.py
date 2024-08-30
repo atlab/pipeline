@@ -33,22 +33,12 @@ sys.path.append(src_dir + f"Pipeline2")
 import PipelineObjects as po
 import pipeline_objects_utils as po_utils
 
+mp_path = src_dir + f"/compress-multiphoton/"
+if mp_path not in sys.path:
+    sys.path.insert(0, mp_path)
+from compress_multiphoton import compute_sensitivity
 
 
-'''TODO - Performance Improvements
-- Give user control over frame_chunk_size
-- Run tests to see what is optimal frame_chunk_size
-- Parallelize things other than making memmaps (crosstalk)
-- Should we store the raw memmaps as int16 (the native datatype in the tiff)? Could cut down on storage usage.
-- Crosstalk is not currently parallelized
-'''
-
-
-'''TODO - New Features/Tables/etc...
-- fix: "key requires, but lacks, one or more of the following" to only print the missing thing
-- Additional tables in Summary Images (like Flux?)
-- New table that stores Flux information?
-'''
 
 
 @schema
@@ -202,26 +192,37 @@ class ScanInfo(dj.Imported):
 
             self.insert1(tuple_)
 
-    def rawscan_mmap(key, frames_per_chunk=2560, force_rebuild=False):
+    @staticmethod
+    def rawscan_mmap(key, frames_per_chunk=2560):
         """Check if the rawscan mmap file/object already exists. Create, if it doesn't exist. 
             This funciton assumes field and bead are part of the key!"""
         
         print(f"Creating rawscan_mmap for:  {key}")
         
-        scan_filename = po_utils.local_filenames_as_wildcard_temp(key)
-        scan = scanreader.read_scan(scan_filename, scan_key=key)
+        key_ = key.copy()
+        key_['nbeads'] = (ScanInfo() & key).fetch1('nbeads')
+        key_['nfields'] = (ScanInfo() & key).fetch1('nfields')
+        key_['nframes'] = (ScanInfo() & key).fetch1('nframes')
+        key_['px_height'] = (ScanInfo.Field() & key).fetch1('px_height')
+        key_['px_width'] = (ScanInfo.Field() & key).fetch1('px_width')
 
         # Create solver object
-        solver = po.RawSolver(key=key, scanreader_obj=scan)
+        scan_filename = po_utils.local_filenames_as_wildcard_temp(key)
+        scan = scanreader.read_scan(scan_filename, scan_key=key)
+        solver = po.RawSolver(key=key_, scan=scan)
 
-        # Create Initial Memmap
-        if solver.memmap_info.get_completed_memmap() is None or force_rebuild:
-            _ = solver.memmap_info.get_init_memmap(rebuild=force_rebuild)
-            po_utils.parallel_apply_params(solver, frames_per_chunk=frames_per_chunk)
-            solver.memmap_info.mark_as_complete()
-        else:
-            print(f"Field: {key['field']-1}, Bead: {key['bead']-1} already completed")
-        return 
+        # If completed memmap already exists, don't recalculate
+        if solver.memmap_info.get_completed_memmap() is not None:
+            print("  Already Calculated")
+            return
+        
+        # Instantiate the memmap
+        _ = solver.memmap_info.get_init_memmap()
+
+        # Apply raster correction
+        po_utils.parallel_apply_params(solver, frames_per_chunk=frames_per_chunk)
+        solver.memmap_info.mark_as_complete()
+
 
 
 @schema
@@ -261,6 +262,49 @@ class CorrectionChannel(dj.Manual):
                 ignore_extra_fields=True,
                 skip_duplicates=True,)
 
+@schema
+class PhotonSensitivity(dj.Computed):
+    definition = """ # 
+
+    -> ScanInfo                         # animal_id, session, scan_idx, version
+    -> CorrectionChannel                # animal_id, session, scan_idx, field
+    -> ScanInfo.Bead                    # animal_id, session, scan_idx, bead
+    ---
+    model                       : varchar(255)
+    min_intensity               : int
+    max_intensity               : int 
+    variance                    : blob 
+    sensitivity                 : float
+    zero_level                  : float 
+    """
+     
+    def make(self, key):
+
+        key_ = key.copy()
+        key_['fps'] = (ScanInfo & key).fetch1('fps')
+        key_['nbeads'] = (ScanInfo() & key).fetch1('nbeads')
+        key_['nfields'] = (ScanInfo() & key).fetch1('nfields')
+        key_['nframes'] = (ScanInfo() & key).fetch1('nframes')
+        key_['px_height'] = (ScanInfo.Field() & key).fetch1('px_height')
+        key_['px_width'] = (ScanInfo.Field() & key).fetch1('px_width')
+
+        solver = po.RawSolver(key=key_)
+        raw_memmap = solver.memmap_info.get_completed_memmap()
+
+        # remove edges because they often have digitization artifacts
+        cropped_scan = raw_memmap[4:-4, 4:-4, :]
+
+        qs = compute_sensitivity(cropped_scan)
+
+        key_['model'] = qs['model']
+        key_['min_intensity'] = qs['min_intensity']
+        key_['max_intensity'] = qs['max_intensity']
+        key_['variance'] = qs['variance']
+        key_['sensitivity'] = qs['sensitivity']
+        key_['zero_level'] = qs['zero_level']
+
+        self.insert1(key_,ignore_extra_fields=True)
+
 
 @schema
 class CrossTalkMethod(dj.Manual):
@@ -292,23 +336,23 @@ class CrossTalkCorrection(dj.Computed):
         """
 
     def make(self, key):
+
+        # Build key for API
         key_ = key.copy()
+        key_['field'] = 0 # Dummy Placeholder TODO rethink later
+        key_['bead'] = 0 # Dummy Placeholder TODO rethink later
+        key_['nbeads'] = (ScanInfo() & key).fetch1('nbeads')
+        key_['nfields'] = (ScanInfo() & key).fetch1('nfields')
+        key_['nframes'] = (ScanInfo() & key).fetch1('nframes')
+        key_['px_heights'] = (ScanInfo.Field() & key).fetch('px_height')
+        key_['px_widths'] = (ScanInfo.Field() & key).fetch('px_width')
 
-        # Load scanreader object
-        scan_filename = (experiment.Scan() & key).local_filenames_as_wildcard
-        scan = scanreader.read_scan(scan_filename, scan_key=key)
-
-        # Create Correction Object
-        key_['field'] = 0 # Temporary Placeholder
-        key_['bead'] = 0 # Temporary Placeholder
-        solver = po.CrosstalkCorrector(key=key_, scanreader_obj=scan)
-        solver.calc_params()
-        del key_['field']
-        del key_['bead']
+        # Do Crosstalk Correction
+        solver = po.CrosstalkCorrector(key=key_)
+        results = solver.calc_params()
 
         # Insert Results
-        key_['crosstalk_correction_mat'] = solver.correction_matrix
-        self.insert1(key_)
+        self.insert1(results, ignore_extra_fields=True)
 
     @staticmethod
     def crosstalk_correction_mmap(key, frames_per_chunk=2560, force_rebuild=False):
@@ -318,25 +362,31 @@ class CrossTalkCorrection(dj.Computed):
         
         print(f"Creating crosstalk_memmmap for:  {key}")
         
-        # create solver
+        # Build key for API
         key_ = key.copy()
-        scan_filename = po_utils.local_filenames_as_wildcard_temp(key)
-        scan = scanreader.read_scan(scan_filename, scan_key=key)
-        solver = po.CrosstalkCorrector(key=key_, scanreader_obj=scan)
+        key_['correction_matrix'] = (CrossTalkCorrection & key).fetch1('crosstalk_correction_mat')
+        key_['nbeads'] = (ScanInfo() & key).fetch1('nbeads')
+        key_['nfields'] = (ScanInfo() & key).fetch1('nfields')
+        key_['nframes'] = (ScanInfo() & key).fetch1('nframes')
+        key_['px_height'] = (ScanInfo.Field() & key).fetch1('px_height')
+        key_['px_width'] = (ScanInfo.Field() & key).fetch1('px_width')
+
+        # Create Solver Object
+        solver = po.CrosstalkCorrector(key=key_)
         
         # If completed memmap already exists, don't recalculate
         if solver.memmap_info.get_completed_memmap() is not None:
-            print("Already Calculated")
+            print("   Already Calculated")
             return
         
         _ = solver.memmap_info.get_init_memmap()
-        solver.correction_matrix = (CrossTalkCorrection & key).fetch1('crosstalk_correction_mat')
         
         # Apply crosstalk correction
         po_utils.parallel_apply_params(solver, frames_per_chunk=frames_per_chunk)
 
         solver.memmap_info.mark_as_complete()
         solver.upper_bead_obj.mark_as_complete()
+
 
 @schema
 class RasterCorrectionMethod(dj.Manual):
@@ -380,32 +430,41 @@ class RasterCorrection(dj.Computed):
         key_['fill_fraction'] = (ScanInfo & key).fetch1('fill_fraction')
         key_['um_height'] = (ScanInfo.Field & key).fetch1('um_height')
         key_['um_width'] = (ScanInfo.Field & key).fetch1('um_width')
+        key_['nfields'] = (ScanInfo & key).fetch1('nfields')
+        key_['nframes'] = (ScanInfo & key).fetch1('nframes')
+        key_['nbeads'] = (ScanInfo & key).fetch1('nbeads')
+        key_['px_height'] = (ScanInfo.Field & key).fetch1('px_height')
+        key_['px_width'] = (ScanInfo.Field & key).fetch1('px_width')
         
-        # Load in scanreader object and create solver object
-        scan_filename = (experiment.Scan & key_).local_filenames_as_wildcard
-        scan = scanreader.read_scan(scan_filename, scan_key=key_)
-        solver = po.RasterCorrector(key=key_, scanreader_obj=scan)
+        # Do Raster Correction
+        solver = po.RasterCorrector(key=key_)
         results = solver.calc_params()
 
+        # Insert
         self.insert1(results,ignore_extra_fields=True)
 
     @staticmethod
     def raster_correction_mmap(key, frames_per_chunk=2560):
+
+        print(f"Creating raster_memmap for:  {key}")
 
         # Build key for API
         key_ = key.copy()
         key_['bidirectional'] = (ScanInfo & key).fetch1('bidirectional')
         key_['fill_fraction'] = (ScanInfo & key).fetch1('fill_fraction')
         key_['raster_phase'] = (RasterCorrection & key).fetch1('raster_phase')
+        key_['nbeads'] = (ScanInfo & key).fetch1('nbeads')
+        key_['nfields'] = (ScanInfo & key).fetch1('nfields')
+        key_['nframes'] = (ScanInfo & key).fetch1('nframes')
+        key_['px_height'] = (ScanInfo.Field & key).fetch1('px_height')
+        key_['px_width'] = (ScanInfo.Field & key).fetch1('px_width')
         
-        # Load in scanreader object and create solver object
-        scan_filename = (experiment.Scan & key_).local_filenames_as_wildcard
-        scan = scanreader.read_scan(scan_filename, scan_key=key_)
-        solver = po.RasterCorrector(key=key_, scanreader_obj=scan)
+        # Create Solver Object
+        solver = po.RasterCorrector(key=key_)
 
         # If completed memmap already exists, don't recalculate
         if solver.memmap_info.get_completed_memmap() is not None:
-            print("Already Calculated")
+            print("   Already Calculated")
             return
         
         # Instantiate the memmap
@@ -458,22 +517,23 @@ class MotionCorrection(dj.Computed):
     def key_source(self):
         return (RasterCorrection() & {"pipe_version": CURRENT_VERSION} & MotionMethodForScan())
 
+
     def make(self, key):
 
         # Build key for API
         key_ = key.copy()
-        key_['um_height'] = (ScanInfo.Field & key_).fetch1('um_height')
-        key_['um_width'] = (ScanInfo.Field & key_).fetch1('um_width')
-        key_['motion_correction_method'] = (MotionMethodForScan & key_).fetch1('motion_correction_method')
-        key_["channel"] = (CorrectionChannel & key_).fetch1("channel")
+        key_['um_height'] = (ScanInfo.Field & key).fetch1('um_height')
+        key_['um_width'] = (ScanInfo.Field & key).fetch1('um_width')
+        key_['motion_correction_method'] = (MotionMethodForScan & key).fetch1('motion_correction_method')
+        key_["channel"] = (CorrectionChannel & key).fetch1("channel")
+        key_['nbeads'] = (ScanInfo() & key).fetch1('nbeads')
+        key_['nfields'] = (ScanInfo() & key).fetch1('nfields')
+        key_['nframes'] = (ScanInfo() & key).fetch1('nframes')
+        key_['px_height'] = (ScanInfo.Field() & key).fetch1('px_height')
+        key_['px_width'] = (ScanInfo.Field() & key).fetch1('px_width')
 
-        # Load in scanreader object and create solver object
-        scan_filename = (experiment.Scan & key_).local_filenames_as_wildcard
-        scan = scanreader.read_scan(scan_filename, scan_key=key_)
-        solver = po.MotionCorrector(key=key_, scanreader_obj=scan)
-        solver.memmap_info.get_memmap_shape_from_scanreader_obj()
-        
-        # Calculate Motion Correction 
+        # Do Motion Correction
+        solver = po.MotionCorrector(key=key_)
         results = solver.calc_params()
 
         # Insert
@@ -483,19 +543,24 @@ class MotionCorrection(dj.Computed):
     @staticmethod
     def motion_correction_mmap(key, frames_per_chunk=2560):
 
-        # Load in scanreader object and create solver object
+        print(f"Creating motion_memmap for:  {key}")
+
+        # Build key for API
         key_ = key.copy()
-        
         key_['x_shifts'] = (MotionCorrection & key).fetch1('x_shifts')
         key_['y_shifts'] = (MotionCorrection & key).fetch1('y_shifts')
+        key_['nbeads'] = (ScanInfo() & key).fetch1('nbeads')
+        key_['nfields'] = (ScanInfo() & key).fetch1('nfields')
+        key_['nframes'] = (ScanInfo() & key).fetch1('nframes')
+        key_['px_height'] = (ScanInfo.Field() & key).fetch1('px_height')
+        key_['px_width'] = (ScanInfo.Field() & key).fetch1('px_width')
 
-        scan_filename = (experiment.Scan & key).local_filenames_as_wildcard
-        scan = scanreader.read_scan(scan_filename, scan_key=key)
-        solver = po.MotionCorrector(key=key_, scanreader_obj=scan)
+        # Create Solver Object
+        solver = po.MotionCorrector(key=key_)
 
         # If completed memmap already exists, don't recalculate
         if solver.memmap_info.get_completed_memmap() is not None:
-            print("Already Calculated")
+            print("   Already Calculated")
             return
         
         # Instantiate the memmap
@@ -549,15 +614,19 @@ class SummaryImages(dj.Computed):
 
         # Get the motion_memmap
         key_ = key.copy()
-        key_['um_height'] = (ScanInfo.Field & key_).fetch1('um_height')
-        key_['um_width'] = (ScanInfo.Field & key_).fetch1('um_width')
-        key_['motion_correction_method'] = (MotionMethodForScan & key_).fetch1('motion_correction_method')
-        key_["channel"] = (CorrectionChannel & key_).fetch1("channel")
-        print(key_)
+        key_['um_height'] = (ScanInfo.Field & key).fetch1('um_height')
+        key_['um_width'] = (ScanInfo.Field & key).fetch1('um_width')
+        key_['motion_correction_method'] = (MotionMethodForScan & key).fetch1('motion_correction_method')
+        key_["channel"] = (CorrectionChannel & key).fetch1("channel")
+        key_['nbeads'] = (ScanInfo() & key).fetch1('nbeads')
+        key_['nfields'] = (ScanInfo() & key).fetch1('nfields')
+        key_['nframes'] = (ScanInfo() & key).fetch1('nframes')
+        key_['px_height'] = (ScanInfo.Field() & key).fetch1('px_height')
+        key_['px_width'] = (ScanInfo.Field() & key).fetch1('px_width')
+
         # Load in scanreader object and create solver object
-        scan_filename = (experiment.Scan & key).local_filenames_as_wildcard
-        scan = scanreader.read_scan(scan_filename, scan_key=key)
-        solver = po.MotionCorrector(key=key_, scanreader_obj=scan)
+
+        solver = po.MotionCorrector(key=key_)
         motion_memmap = solver.memmap_info.get_completed_memmap()
 
         for channel in range(nchannels):
@@ -754,31 +823,12 @@ class Segmentation(dj.Computed):
             """Return this mask as an image (2-d numpy array)."""
             # Get params
             pixels, weights = self.fetch("pixels", "weights")
-            image_height, image_width = (ScanInfo.Field() & self).fetch1(
-                "px_height", "px_width"
-            )
+            image_height, image_width = (ScanInfo.Field() & self).fetch1("px_height", "px_width")
 
             # Reshape mask
-            mask = Segmentation.reshape_masks(
-                pixels, weights, image_height, image_width
-            )
+            mask = Segmentation.reshape_masks(pixels, weights, image_height, image_width)
 
             return np.squeeze(mask)
-
-    class Manual(dj.Part):
-        definition = """ # masks created manually
-
-        -> Segmentation
-        """
-
-        def make(self, key):
-            print("Warning: Manual segmentation is not implemented in Python.")
-            # Copy any masks (and MaskClassification) that were there before
-            # Delete key from Segmentation (this is needed for trace and ScanSet and Activity computation to restart when things are added)
-            # Show GUI with the current masks
-            # User modifies it somehow to produce the new set of masks
-            # Insert info in Segmentation -> Segmentation.Manual -> Segmentation.Mask -> MaskClassification -> MaskClassification.Type
-            # http://scikit-image.org/docs/dev/api/skimage.future.html#manual-lasso-segmentation (Python lasso masks)
 
     class CNMF(dj.Part):
         definition = """ # source extraction using constrained non-negative matrix factorization
@@ -787,313 +837,6 @@ class Segmentation(dj.Computed):
         ---
         params              : varchar(1024)     # parameters send to CNMF as JSON array
         """
-
-        def make(self, key):
-            """Use CNMF to extract masks and traces.
-
-            See caiman_interface.extract_masks for explanation of parameters
-            """
-            # from pipeline.utils import caiman_interface as cmn
-            import json
-            import uuid
-            import os
-
-            print("")
-            print("*" * 85)
-            print("Processing {}".format(key))
-
-            # Get some parameters
-            field_id = key["field"] - 1
-            channel = key["channel"] - 1
-            bead = key["bead"] - 1
-            image_height, image_width = (ScanInfo.Field() & key).fetch1(
-                "px_height", "px_width"
-            )
-            num_frames = (ScanInfo() & key).fetch1("nframes")
-
-            # Load in motion_mmap
-            motion_mmap = MotionCorrection().motion_correction_mmap(key)
-
-            # Create memory mapped file (as expected by CaImAn)
-            print("Creating memory mapped file...")
-            filename = "/tmp/caiman-{}_d1_{}_d2_{}_d3_1_order_C_frames_{}_.mmap".format(
-                uuid.uuid4(), image_height, image_width, num_frames
-            )
-            segmentation_mmap_shape = (image_height * image_width, num_frames)
-            segmentation_mmap = np.memmap(
-                filename, mode="w+", shape=segmentation_mmap_shape, dtype=np.float32
-            )
-
-            # Load (and reshape) relevant section of motion_mmap into segmentation_mmap
-            segmentation_mmap[:] = motion_mmap[bead, :, :, :].reshape(-1, num_frames)
-
-            # Reduce: Use the minimum values to make memory mapped scan nonnegative
-            segmentation_mmap -= np.min(
-                segmentation_mmap
-            )  # bit inefficient but necessary
-            segmentation_mmap.flush()
-
-            # Set CNMF parameters
-            ## Set general parameters
-            kwargs = {}
-            kwargs["num_background_components"] = 1
-            kwargs["merge_threshold"] = 0.7
-            kwargs["fps"] = (ScanInfo() & key).fetch1("fps")
-
-            # Set params specific to method and segmentation target
-            target = (SegmentationTask() & key).fetch1("compartment")
-            if key["segmentation_method"] == 2:  # nmf
-                if target == "axon":
-                    kwargs["init_on_patches"] = True
-                    kwargs["proportion_patch_overlap"] = 0.2  # 20% overlap
-                    kwargs["num_components_per_patch"] = 15
-                    kwargs["init_method"] = "sparse_nmf"
-                    kwargs["snmf_alpha"] = 500  # 10^2 to 10^3.5 is a good range
-                    kwargs["patch_size"] = tuple(
-                        50 / (ScanInfo.Field() & key).microns_per_pixel
-                    )  # 50 x 50 microns
-                elif target == "bouton":
-                    kwargs["init_on_patches"] = False
-                    kwargs["num_components"] = (
-                        SegmentationTask() & key
-                    ).estimate_num_components()
-                    kwargs["init_method"] = "greedy_roi"
-                    kwargs["soma_diameter"] = tuple(
-                        2 / (ScanInfo.Field() & key).microns_per_pixel
-                    )
-                else:  # soma
-                    kwargs["init_on_patches"] = False
-                    kwargs["num_components"] = (
-                        SegmentationTask() & key
-                    ).estimate_num_components()
-                    kwargs["init_method"] = "greedy_roi"
-                    kwargs["soma_diameter"] = tuple(
-                        14 / (ScanInfo.Field() & key).microns_per_pixel
-                    )
-            else:  # nmf-new
-                kwargs["init_on_patches"] = True
-                kwargs["proportion_patch_overlap"] = 0.2  # 20% overlap
-                if target == "axon":
-                    kwargs["num_components_per_patch"] = 15
-                    kwargs["init_method"] = "sparse_nmf"
-                    kwargs["snmf_alpha"] = 500  # 10^2 to 10^3.5 is a good range
-                    kwargs["patch_size"] = tuple(
-                        50 / (ScanInfo.Field() & key).microns_per_pixel
-                    )  # 50 x 50 microns
-                elif target == "bouton":
-                    kwargs["num_components_per_patch"] = 5
-                    kwargs["init_method"] = "greedy_roi"
-                    kwargs["patch_size"] = tuple(
-                        20 / (ScanInfo.Field() & key).microns_per_pixel
-                    )  # 20 x 20 microns
-                    kwargs["soma_diameter"] = tuple(
-                        2 / (ScanInfo.Field() & key).microns_per_pixel
-                    )
-                else:  # soma
-                    kwargs["num_components_per_patch"] = 6
-                    kwargs["init_method"] = "greedy_roi"
-                    kwargs["patch_size"] = tuple(
-                        50 / (ScanInfo.Field() & key).microns_per_pixel
-                    )
-                    kwargs["soma_diameter"] = tuple(
-                        8 / (ScanInfo.Field() & key).microns_per_pixel
-                    )
-
-            ## Set performance/execution parameters (heuristically), decrease if memory overflows
-            kwargs["num_processes"] = 8  # Set to None for all cores available
-            kwargs["num_pixels_per_process"] = 10000
-
-            # Extract traces
-            print("Extracting masks and traces (cnmf)...")
-            scan_ = segmentation_mmap.reshape(
-                (image_height, image_width, num_frames), order="F"
-            )
-            cnmf_result = cmn.extract_masks(scan_, segmentation_mmap, **kwargs)
-            (
-                masks,
-                traces,
-                background_masks,
-                background_traces,
-                raw_traces,
-            ) = cnmf_result
-
-            # Delete memory mapped scan
-            print("Deleting memory mapped scan...")
-            os.remove(segmentation_mmap.filename)
-
-            # Insert CNMF results
-            print("Inserting masks, background components and traces...")
-            dj.conn()
-
-            ## Insert in CNMF, Segmentation and Fluorescence
-            self.insert1(
-                {**key, "params": json.dumps(kwargs)}, ignore_extra_fields=True
-            )
-            Fluorescence().insert1(
-                key, allow_direct_insert=True, ignore_extra_fields=True
-            )  # we also insert traces
-
-            ## Insert background components
-            Segmentation.CNMFBackground().insert1(
-                {**key, "masks": background_masks, "activity": background_traces},
-                ignore_extra_fields=True,
-            )
-
-            ## Insert masks and traces (masks in Matlab format)
-            num_masks = masks.shape[-1]
-            if num_masks > 0:
-                num_masks = masks.shape[-1]
-                masks = masks.reshape(
-                    -1, num_masks, order="F"
-                ).T  # [num_masks x num_pixels] in F order
-                raw_traces = raw_traces.astype(np.float32, copy=False)
-                for mask_id, mask, trace in zip(
-                    range(1, num_masks + 1), masks, raw_traces
-                ):
-                    mask_pixels = np.where(mask)[0]
-                    mask_weights = mask[mask_pixels]
-                    mask_pixels += 1  # matlab indices start at 1
-                    Segmentation.Mask().insert1(
-                        {
-                            **key,
-                            "mask_id": mask_id,
-                            "pixels": mask_pixels,
-                            "weights": mask_weights,
-                        },
-                        ignore_extra_fields=True,
-                    )
-
-                    Fluorescence.Trace().insert1(
-                        {**key, "mask_id": mask_id, "trace": trace},
-                        allow_direct_insert=True,
-                        ignore_extra_fields=True,
-                    )
-
-            Segmentation().notify(key)
-
-        def save_video(
-            self,
-            filename="cnmf_results.mp4",
-            start_index=0,
-            seconds=30,
-            dpi=250,
-            first_n=None,
-        ):
-            """Creates an animation video showing the results of CNMF.
-
-            :param string filename: Output filename (path + filename)
-            :param int start_index: Where in the scan to start the video.
-            :param int seconds: How long in seconds should the animation run.
-            :param int dpi: Dots per inch, controls the quality of the video.
-            :param int first_n: Draw only the first n components.
-
-            :returns Figure. You can call show() on it.
-            :rtype: matplotlib.figure.Figure
-            """
-            # Get fps and calculate total number of frames
-            fps = (ScanInfo() & self).fetch1("fps")
-            num_video_frames = int(round(fps * seconds))
-            stop_index = start_index + num_video_frames
-
-            # Load the scan
-            channel = self.fetch1("channel") - 1
-            field_id = self.fetch1("field") - 1
-            scan_filename = (experiment.Scan() & self).local_filenames_as_wildcard
-            scan = scanreader.read_scan(scan_filename, dtype=np.float32)
-            scan_ = scan[field_id, :, :, channel, start_index:stop_index]
-
-            # Correct the scan
-            correct_raster = (RasterCorrection() & self).get_correct_raster()
-            correct_motion = (MotionCorrection() & self).get_correct_motion()
-            scan_ = correct_motion(
-                correct_raster(scan_), slice(start_index, stop_index)
-            )
-
-            # Get scan dimensions
-            image_height, image_width, _ = scan_.shape
-            num_pixels = image_height * image_width
-
-            # Get masks and traces
-            masks = (Segmentation() & self).get_all_masks()
-            traces = (Fluorescence() & self).get_all_traces()
-            background_masks, background_traces = (
-                Segmentation.CNMFBackground() & self
-            ).fetch1("masks", "activity")
-
-            # Select first n components
-            if first_n is not None:
-                masks = masks[:, :, :first_n]
-                traces = traces[:first_n, :]
-
-            # Drop frames that won't be displayed
-            traces = traces[:, start_index:stop_index]
-            background_traces = background_traces[:, start_index:stop_index]
-
-            # Create movies
-            extracted = np.dot(masks.reshape(num_pixels, -1), traces)
-            extracted = extracted.reshape(image_height, image_width, -1)
-            background = np.dot(
-                background_masks.reshape(num_pixels, -1), background_traces
-            )
-            background = background.reshape(image_height, image_width, -1)
-            residual = scan_ - extracted - background
-
-            # Create animation
-            import matplotlib.animation as animation
-
-            ## Set the figure
-            fig, axes = plt.subplots(2, 2, sharex=True, sharey=True)
-
-            axes[0, 0].set_title("Original (Y)")
-            im1 = axes[0, 0].imshow(
-                scan_[:, :, 0], vmin=scan_.min(), vmax=scan_.max()
-            )  # just a placeholder
-            fig.colorbar(im1, ax=axes[0, 0])
-
-            axes[0, 1].set_title("Extracted (A*C)")
-            im2 = axes[0, 1].imshow(
-                extracted[:, :, 0], vmin=extracted.min(), vmax=extracted.max()
-            )
-            fig.colorbar(im2, ax=axes[0, 1])
-
-            axes[1, 0].set_title("Background (B*F)")
-            im3 = axes[1, 0].imshow(
-                background[:, :, 0], vmin=background.min(), vmax=background.max()
-            )
-            fig.colorbar(im3, ax=axes[1, 0])
-
-            axes[1, 1].set_title("Residual (Y - A*C - B*F)")
-            im4 = axes[1, 1].imshow(
-                residual[:, :, 0], vmin=residual.min(), vmax=residual.max()
-            )
-            fig.colorbar(im4, ax=axes[1, 1])
-
-            for ax in axes.ravel():
-                ax.axis("off")
-
-            ## Make the animation
-            def update_img(i):
-                im1.set_data(scan_[:, :, i])
-                im2.set_data(extracted[:, :, i])
-                im3.set_data(background[:, :, i])
-                im4.set_data(residual[:, :, i])
-
-            video = animation.FuncAnimation(
-                fig, update_img, scan_.shape[2], interval=1000 / fps
-            )
-
-            # Save animation
-            if not filename.endswith(".mp4"):
-                filename += ".mp4"
-            print("Saving video at:", filename)
-            print(
-                "If this takes too long, stop it and call again with dpi <",
-                dpi,
-                "(default)",
-            )
-            video.save(filename, dpi=dpi)
-
-            return fig
 
     class CNMFBackground(dj.Part):
         definition = """ # inferred background components
@@ -1104,33 +847,29 @@ class Segmentation(dj.Computed):
         activity            : longblob      # array (num_background_components x timesteps)
         """
 
-
     def make(self, key):
         
         # Build key for API
         key_ = key.copy()
-
-        # TODO: API needs string, dj needs number. HACK!
-        if key_['segmentation_method'] == 6:
+        if key_['segmentation_method'] == 6: # TODO Clean this up
             key_['segmentation_method'] = "caiman"
         elif key_['segmentation_method'] == 7:
-            print('Made it here!')
             key_['segmentation_method'] = "suite2p"
-
         key_['motion_correction_method'] = (MotionMethodForScan() & key).fetch1('motion_correction_method') # HACK: This assumes only 1 type of motion correction
         key_['fps'] = (ScanInfo & key).fetch1('fps')
-
-        # Load in scanreader object and create solver object
-        scan_filename = (experiment.Scan & key).local_filenames_as_wildcard
-        scan = scanreader.read_scan(scan_filename, scan_key=key)
-        solver = po.SegmentationSolver(key=key_, scanreader_obj=scan)
-
-        # Do Segmentation
-        results = solver.calc_params()
-
+        key_['nbeads'] = (ScanInfo() & key).fetch1('nbeads')
+        key_['nfields'] = (ScanInfo() & key).fetch1('nfields')
+        key_['nframes'] = (ScanInfo() & key).fetch1('nframes')
+        key_['px_height'] = (ScanInfo.Field() & key).fetch1('px_height')
+        key_['px_width'] = (ScanInfo.Field() & key).fetch1('px_width')
 
         # Insert into Segmentation
         self.insert1(key, ignore_extra_fields=True, skip_duplicates=True)
+
+        # Do Segmentation
+        solver = po.SegmentationSolver(key=key_)
+        results = solver.calc_params()
+
 
         # Insert into Fluorescence
         Fluorescence().insert1(key, 
@@ -1178,10 +917,6 @@ class Segmentation(dj.Computed):
             Fluorescence.Trace().insert1({**key, "mask_id": mask_id, "trace": trace}, 
                                           allow_direct_insert=True,
                                           skip_duplicates=True,)
-
-
-
-
 
 
     @staticmethod
@@ -1344,7 +1079,6 @@ class Fluorescence(dj.Computed):
         return np.array([x.squeeze() for x in traces])
 
 
-''' MaskClassification
 @schema
 class MaskClassification(dj.Computed):
     definition = """ # classification of segmented masks.
@@ -1371,22 +1105,17 @@ class MaskClassification(dj.Computed):
         """
 
     def make(self, key):
+
         # Skip axonal scans
         target = (SegmentationTask() & key).fetch1("compartment")
         if key["classification_method"] == 2 and target != "soma":
-            print(
-                "Warning: Skipping {}. Automatic classification works only with somatic "
-                "scans".format(key)
-            )
+            print("Warning: Skipping {}. Automatic classification works only with somatic "
+                  "scans".format(key))
             return
 
         # Get masks
-        image_height, image_width = (ScanInfo.Field() & key).fetch1(
-            "px_height", "px_width"
-        )
-        mask_ids, pixels, weights = (Segmentation.Mask() & key).fetch(
-            "mask_id", "pixels", "weights"
-        )
+        image_height, image_width = (ScanInfo.Field() & key).fetch1("px_height", "px_width")
+        mask_ids, pixels, weights = (Segmentation.Mask() & key).fetch("mask_id", "pixels", "weights")
         masks = Segmentation.reshape_masks(pixels, weights, image_height, image_width)
 
         # Classify masks
@@ -1398,16 +1127,21 @@ class MaskClassification(dj.Computed):
             template = (SummaryImages.Correlation() & key).fetch1("correlation_image")
             masks = masks.transpose([2, 0, 1])  # num_masks, image_height, image_width
             mask_types = mask_classification.classify_manual(masks, template)
+
         elif key["classification_method"] == 2:  # cnn-caiman
             from .utils import caiman_interface as cmn
 
             soma_diameter = tuple(14 / (ScanInfo.Field() & key).microns_per_pixel)
             probs = cmn.classify_masks(masks, soma_diameter)
             mask_types = ["soma" if prob > 0.75 else "artifact" for prob in probs]
+
+        elif key['classification_method'] == 3: # suite2p Classification
+            # HACK / TODO: Classification is done in Segmentation. All sutie2p masks in Segmentation are somas. 
+            # The information on which masks are/n't somas is within results.iscell.
+            mask_types = ["soma"] * len(masks) 
+
         else:
-            msg = "Unrecognized classification method {}".format(
-                key["classification_method"]
-            )
+            msg = "Unrecognized classification method {}".format(key["classification_method"])
             raise PipelineException(msg)
 
         print("Generated types:", mask_types)
@@ -1416,10 +1150,9 @@ class MaskClassification(dj.Computed):
         self.insert1(key)
         for mask_id, mask_type in zip(mask_ids, mask_types):
             MaskClassification.Type().insert1(
-                {**key, "mask_id": mask_id, "type": mask_type}
-            )
+                {**key, "mask_id": mask_id, "type": mask_type})
 
-        self.notify(key, mask_types)
+        # self.notify(key, mask_types)
 
     @notify.ignore_exceptions
     def notify(self, key, mask_types):
@@ -1490,9 +1223,8 @@ class MaskClassification(dj.Computed):
             plt.contour(cumsum_mask, [threshold], linewidths=0.8, colors=[color])
 
         return fig
-'''
 
-''' ScanSet
+
 @schema
 class ScanSet(dj.Computed):
     definition = """ # set of all units in the same scan
@@ -1536,12 +1268,8 @@ class ScanSet(dj.Computed):
         from pipeline.utils import caiman_interface as cmn
 
         # Get masks
-        image_height, image_width = (ScanInfo.Field() & key).fetch1(
-            "px_height", "px_width"
-        )
-        mask_ids, pixels, weights = (Segmentation.Mask() & key).fetch(
-            "mask_id", "pixels", "weights"
-        )
+        image_height, image_width = (ScanInfo.Field() & key).fetch1("px_height", "px_width")
+        mask_ids, pixels, weights = (Segmentation.Mask() & key).fetch("mask_id", "pixels", "weights")
         masks = Segmentation.reshape_masks(pixels, weights, image_height, image_width)
 
         # Compute units' coordinates
@@ -1549,16 +1277,11 @@ class ScanSet(dj.Computed):
         um_center = (ScanInfo.Field() & key).fetch1("y", "x")
         um_z = (ScanInfo.Field() & key).fetch1("z")
         px_centroids = cmn.get_centroids(masks)
-        um_centroids = (
-            um_center
-            + (px_centroids - px_center) * (ScanInfo.Field() & key).microns_per_pixel
-        )
+        um_centroids = (um_center+ (px_centroids - px_center) * (ScanInfo.Field() & key).microns_per_pixel)
 
         # Compute units' delays
         delay_image = (ScanInfo.Field() & key).fetch1("delay_image")
-        delays = np.sum(masks * np.expand_dims(delay_image, -1), axis=(0, 1)) / np.sum(
-            masks, axis=(0, 1)
-        )
+        delays = np.sum(masks * np.expand_dims(delay_image, -1), axis=(0, 1)) / np.sum(masks, axis=(0, 1))
         delays = np.round(delays * 1e3).astype(np.int16)  # in milliseconds
 
         # Get next unit_id for scan
@@ -1570,9 +1293,7 @@ class ScanSet(dj.Computed):
 
         # Insert units
         unit_ids = range(unit_id, unit_id + len(mask_ids) + 1)
-        for unit_id, mask_id, (um_y, um_x), (px_y, px_x), delay in zip(
-            unit_ids, mask_ids, um_centroids, px_centroids, delays
-        ):
+        for unit_id, mask_id, (um_y, um_x), (px_y, px_x), delay in zip(unit_ids, mask_ids, um_centroids, px_centroids, delays):
             ScanSet.Unit().insert1({**key, "unit_id": unit_id, "mask_id": mask_id})
 
             unit_info = {
@@ -1583,11 +1304,8 @@ class ScanSet(dj.Computed):
                 "um_z": um_z,
                 "px_x": px_x,
                 "px_y": px_y,
-                "ms_delay": delay,
-            }
-            ScanSet.UnitInfo().insert1(
-                unit_info, ignore_extra_fields=True
-            )  # ignore field and channel
+                "ms_delay": delay,}
+            ScanSet.UnitInfo().insert1(unit_info, ignore_extra_fields=True)  # ignore field and channel
 
     def plot_centroids(self, first_n=None):
         """Draw masks centroids over the correlation image. Works on a single field/channel
@@ -1659,9 +1377,7 @@ class ScanSet(dj.Computed):
             xs, ys = units_rel.fetch("px_x", "px_y", order_by="unit_id")
             centroids = np.stack([xs, ys], axis=1)
         return centroids
-'''
 
-''' Activity
 @schema
 class Activity(dj.Computed):
     definition = """ # activity inferred from fluorescence traces
@@ -1699,9 +1415,7 @@ class Activity(dj.Computed):
 
         # Get fluorescence
         fps = (ScanInfo() & key).fetch1("fps")
-        unit_ids, traces = (ScanSet.Unit() * Fluorescence.Trace() & key).fetch(
-            "unit_id", "trace"
-        )
+        unit_ids, traces = (ScanSet.Unit() * Fluorescence.Trace() & key).fetch("unit_id", "trace")
         full_traces = [signal.fill_nans(np.squeeze(trace).copy()) for trace in traces]
 
         # Insert in Activity
@@ -1760,22 +1474,25 @@ class Activity(dj.Computed):
 
             scan_fps = (ScanInfo & key).fetch1('fps')
             deconvolve = partial(cmn.deconvolve_detrended, scan_fps=scan_fps)
+
             with mp.Pool(10) as pool:
                 results = pool.map(deconvolve, full_traces)
-            for unit_id, (spike_trace, ar_coeffs) in zip(unit_ids, results):
+
+            for unit_id, (spike_trace, ar_coeffs) in tqdm(zip(unit_ids, results)):
+
                 spike_trace = spike_trace.astype(np.float32, copy=False)
+
                 Activity.Trace().insert1(
-                    {**key, "unit_id": unit_id, "trace": spike_trace}
-                )
+                    {**key, "unit_id": unit_id, "trace": spike_trace})
+                
                 Activity.ARCoefficients().insert1(
                     {**key, "unit_id": unit_id, "g": ar_coeffs},
-                    ignore_extra_fields=True,
-                )
+                    ignore_extra_fields=True,)
         else:
             msg = "Unrecognized spike method {}".format(key["spike_method"])
             raise PipelineException(msg)
 
-        self.notify(key)
+        # self.notify(key)
 
     @notify.ignore_exceptions
     def notify(self, key):
@@ -1832,7 +1549,7 @@ class Activity(dj.Computed):
         """ Returns a num_traces x num_timesteps matrix with all spikes."""
         spikes = (Activity.Trace() & self).fetch("trace", order_by="unit_id")
         return np.array([x.squeeze() for x in spikes])
-'''
+
 
 ''' ScanDone
 @schema
@@ -2547,13 +2264,7 @@ class Quality(dj.Computed):
         slack_user.notify(file=img_filename, file_title=msg)
 '''
 
-
-
-############################################################################################
-#################################### TABLES NOT TESTING ####################################
-############################################################################################
-
-
+''' DoNotSegment
 # @schema
 # class DoNotSegment(dj.Manual):
 #     definition = """ # field/channels that should not be segmented (used for web interface only)
@@ -2562,4 +2273,4 @@ class Quality(dj.Computed):
 #     -> LBMField
 #     -> shared.Channel
 #     """
-
+'''
