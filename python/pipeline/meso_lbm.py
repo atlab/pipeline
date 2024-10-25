@@ -23,7 +23,8 @@ from .exceptions import PipelineException
 
 logger = logging.getLogger(__name__)
 
-schema = dj.schema(f"{dj.config['database.user']}_meso_lbm_dev", locals(), create_tables=True)
+# schema = dj.schema(f"{dj.config['database.user']}_meso_lbm_dev", locals(), create_tables=True)
+schema = dj.schema(f"mgagnon_meso_lbm_dev", locals(), create_tables=True)
 CURRENT_VERSION = 3
 
 
@@ -219,7 +220,6 @@ class ScanInfo(dj.Imported):
         # Instantiate the memmap
         _ = solver.memmap_info.get_init_memmap()
 
-        # Apply raster correction
         po_utils.parallel_apply_params(solver, frames_per_chunk=frames_per_chunk)
         solver.memmap_info.mark_as_complete()
 
@@ -383,7 +383,7 @@ class CrossTalkCorrection(dj.Computed):
         
         # Apply crosstalk correction
         po_utils.parallel_apply_params(solver, frames_per_chunk=frames_per_chunk)
-
+        solver.memmap_info.init_memmap.flush()
         solver.memmap_info.mark_as_complete()
         solver.upper_bead_obj.mark_as_complete()
 
@@ -537,8 +537,8 @@ class MotionCorrection(dj.Computed):
         results = solver.calc_params()
 
         # Insert
-        self.insert1(results, ignore_extra_fields=True)
-        self.MotionMethodUsed.insert1(results, ignore_extra_fields=True)
+        self.insert1(results, ignore_extra_fields=True, skip_duplicates=True)
+        self.MotionMethodUsed.insert1(results, ignore_extra_fields=True, skip_duplicates=True)
 
     @staticmethod
     def motion_correction_mmap(key, frames_per_chunk=2560):
@@ -1294,7 +1294,7 @@ class ScanSet(dj.Computed):
         # Insert units
         unit_ids = range(unit_id, unit_id + len(mask_ids) + 1)
         for unit_id, mask_id, (um_y, um_x), (px_y, px_x), delay in zip(unit_ids, mask_ids, um_centroids, px_centroids, delays):
-            ScanSet.Unit().insert1({**key, "unit_id": unit_id, "mask_id": mask_id})
+            ScanSet.Unit().insert1({**key, "unit_id": unit_id, "mask_id": mask_id}, skip_duplicates=True)
 
             unit_info = {
                 **key,
