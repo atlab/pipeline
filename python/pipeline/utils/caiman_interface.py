@@ -34,6 +34,12 @@ INDICATOR_PROFILES = {
         'detrend_period': 600,
         'init_tsub': None,
     },
+    'gcamp8s': {
+        'ar_order': 2,
+        'fudge_factor': 0.96,
+        'detrend_period': 300,
+        'init_tsub': 2,
+    },
 }
 
 
@@ -43,7 +49,10 @@ def get_indicator_profile(indicator='generic', fps=None):
     ``fps`` is accepted now so profile selection can become acquisition-aware without
     changing callers again.
     """
-    return dict(INDICATOR_PROFILES.get(indicator, INDICATOR_PROFILES['generic']))
+    profile = dict(INDICATOR_PROFILES.get(indicator, INDICATOR_PROFILES['generic']))
+    if indicator == 'gcamp8s' and fps is not None and fps < 10:
+        profile['ar_order'] = 1
+    return profile
 
 
 @mute_function
