@@ -46,7 +46,7 @@ class SegmentationMethod(dj.Lookup):
         [4, 'nmf-boutons', 'nmf for axonal terminals', 'python'],
         [5, '3d-conv', 'masks from the segmentation of the stack', 'python'],
         [6, 'nmf-new', 'same as method 3 (nmf-patches) but with some better tuned params', 'python'],
-        [7, 'nmf-gcamp8s', 'same as nmf-new but with GCaMP8s CaImAn initialization defaults', 'python']
+        [10, 'nmf-gcamp8s', 'same as nmf-new but with GCaMP8s CaImAn initialization defaults', 'python']
     ]
 
 @schema

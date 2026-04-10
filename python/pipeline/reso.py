@@ -1211,7 +1211,7 @@ class Segmentation(dj.Computed):
                     kwargs['patch_size'] = tuple(50 / (ScanInfo() & key).microns_per_pixel)
                     kwargs['soma_diameter'] = tuple(8 / (ScanInfo() & key).microns_per_pixel)
 
-            if key['segmentation_method'] == 7: # nmf-gcamp8s
+            if key['segmentation_method'] == 10: # nmf-gcamp8s
                 profile = cmn.get_indicator_profile(indicator='gcamp8s', fps=kwargs['fps'])
                 kwargs['init_tsub'] = profile['init_tsub']
 
@@ -1370,7 +1370,7 @@ class Segmentation(dj.Computed):
         # Create masks
         if key['segmentation_method'] == 1:  # manual
             Segmentation.Manual().make(key)
-        elif key['segmentation_method'] in [2, 6, 7]:  # nmf and nmf-patches
+        elif key['segmentation_method'] in [2, 6, 10]:  # nmf and nmf-patches
             self.insert1(key)
             Segmentation.CNMF().make(key)
         elif key['segmentation_method'] in [3, 4]:  # nmf_patches
