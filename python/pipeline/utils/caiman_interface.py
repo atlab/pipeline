@@ -27,12 +27,31 @@ def mute_function(f):
     return wrapper
 
 
+INDICATOR_PROFILES = {
+    'generic': {
+        'ar_order': 2,
+        'fudge_factor': 0.96,
+        'detrend_period': 600,
+        'init_tsub': None,
+    },
+}
+
+
+def get_indicator_profile(indicator='generic', fps=None):
+    """Return CaImAn defaults for a calcium indicator profile.
+
+    ``fps`` is accepted now so profile selection can become acquisition-aware without
+    changing callers again.
+    """
+    return dict(INDICATOR_PROFILES.get(indicator, INDICATOR_PROFILES['generic']))
+
+
 @mute_function
 def extract_masks(scan, mmap_scan, num_components=200, num_background_components=1,
                   merge_threshold=0.8, init_on_patches=True, init_method='greedy_roi',
                   soma_diameter=(14, 14), snmf_alpha=None, patch_size=(50, 50),
                   proportion_patch_overlap=0.2, num_components_per_patch=5,
-                  num_processes=8, num_pixels_per_process=5000, fps=15):
+                  num_processes=8, num_pixels_per_process=5000, fps=15, init_tsub=None):
     """ Extract masks from multi-photon scans using CNMF.
 
     Uses constrained non-negative matrix factorization to find spatial components (masks)
@@ -68,6 +87,8 @@ def extract_masks(scan, mmap_scan, num_components=200, num_background_components
     :param int num_pixels_per_process: Number of pixels that a process handles each
         iteration.
     :param fps: Frame rate. Used for temporal downsampling and to remove bad components.
+    :param int init_tsub: Temporal downsampling factor for component initialization. If
+        None, use the legacy fps-derived value.
 
     :returns: Weighted masks (image_height x image_width x num_components). Inferred
         location of each component.
@@ -100,6 +121,7 @@ def extract_masks(scan, mmap_scan, num_components=200, num_background_components
         half_patch_size = np.int32(np.round(patch_size / 2))
         num_components_per_patch = int(round(num_components_per_patch))
         patch_overlap = np.int32(np.round(patch_size * proportion_patch_overlap))
+        init_tsub = max(int(fps / 2), 1) if init_tsub is None else int(init_tsub)
 
         # Create options dictionary (needed for run_CNMF_patches)
         options = {'patch_params': {'ssub': 'UNUSED.', 'tsub': 'UNUSED', 'nb': num_background_components,
@@ -110,7 +132,7 @@ def extract_masks(scan, mmap_scan, num_components=200, num_background_components
                    'temporal_params': {'p': 0, 'method': 'UNUSED.', 'block_size': 'UNUSED.'},
                    'init_params': {'K': num_components_per_patch, 'gSig': np.array(soma_diameter)/2,
                                    'gSiz': None, 'method': init_method, 'alpha_snmf': snmf_alpha,
-                                   'nb': num_background_components, 'ssub': 1, 'tsub': max(int(fps / 2), 1),
+                                   'nb': num_background_components, 'ssub': 1, 'tsub': init_tsub,
                                    'options_local_NMF': 'UNUSED.', 'normalize_init': True,
                                    'rolling_sum': True, 'rolling_length': 100, 'min_corr': 'UNUSED',
                                    'min_pnr': 'UNUSED', 'deconvolve_options_init': 'UNUSED',
@@ -375,25 +397,26 @@ def _rank1_NMF(scan, trace, num_iterations=5):
     return mask, trace
 
 
-def deconvolve(trace, AR_order=2):
+def deconvolve(trace, AR_order=2, fudge_factor=0.96):
     """ Deconvolve traces using noise constrained deconvolution (Pnevmatikakis et al., 2016)
 
     :param np.array trace: 1-d array (num_frames) with the fluorescence trace.
     :param int AR_order: Order of the autoregressive process used to model the impulse
         response function, e.g., 0 = no modelling; 2 = model rise plus exponential decay.
+    :param float fudge_factor: Regularization term passed to constrained FOOPSI.
 
     :returns: Deconvolved spike trace.
     :returns: AR coefficients (AR_order) that model the calcium response:
             c(t) = c(t-1) * AR_coeffs[0] + c(t-2) * AR_coeffs[1] + ...
     """
     _, _, _, AR_coeffs, _, spike_trace, _ = deconvolution.constrained_foopsi(trace,
-        p=AR_order, method='cvxpy', bas_nonneg=False, fudge_factor=0.96)
-        # fudge_factor is a regularization term
+        p=AR_order, method='cvxpy', bas_nonneg=False, fudge_factor=fudge_factor)
 
     return spike_trace, AR_coeffs
 
 
-def deconvolve_detrended(trace, scan_fps, detrend_period=600, AR_order=2):
+def deconvolve_detrended(trace, scan_fps, detrend_period=600, AR_order=2,
+                         fudge_factor=0.96):
     """Same as the the `deconvolve` method, except that the fluorescence trace is detrended 
     before autoregressive modeling
 
@@ -402,6 +425,7 @@ def deconvolve_detrended(trace, scan_fps, detrend_period=600, AR_order=2):
     :param float detrend_period: number of seconds over which percentiles are computed
     :param int AR_order: Order of the autoregressive process used to model the impulse
         response function, e.g., 0 = no modelling; 2 = model rise plus exponential decay.
+    :param float fudge_factor: Regularization term passed to constrained FOOPSI.
 
     :returns: Deconvolved spike trace.
     :returns: AR coefficients (AR_order) that model the calcium response:
@@ -416,7 +440,7 @@ def deconvolve_detrended(trace, scan_fps, detrend_period=600, AR_order=2):
         trace = trace - percentile_filter(trace, data_prct, detrend_window)
 
     _, _, _, AR_coeffs, _, spike_trace, _ = deconvolution.constrained_foopsi(trace,
-        p=AR_order, method='cvxpy', bas_nonneg=False, fudge_factor=0.96)
+        p=AR_order, method='cvxpy', bas_nonneg=False, fudge_factor=fudge_factor)
 
     return spike_trace, AR_coeffs
 
