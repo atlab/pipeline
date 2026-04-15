@@ -1369,6 +1369,12 @@ class Segmentation(dj.Computed):
                         8 / (ScanInfo.Field() & key).microns_per_pixel
                     )
 
+            if key["segmentation_method"] == 10:  # nmf-gcamp8s
+                profile = cmn.get_indicator_profile(
+                    indicator="gcamp8s", fps=kwargs["fps"]
+                )
+                kwargs["init_tsub"] = profile["init_tsub"]
+
             ## Set performance/execution parameters (heuristically), decrease if memory overflows
             kwargs["num_processes"] = 8  # Set to None for all cores available
             kwargs["num_pixels_per_process"] = 10000
@@ -1569,7 +1575,7 @@ class Segmentation(dj.Computed):
         # Create masks
         if key["segmentation_method"] == 1:  # manual
             Segmentation.Manual().make(key)
-        elif key["segmentation_method"] in [2, 6]:  # nmf
+        elif key["segmentation_method"] in [2, 6, 10]:  # nmf
             self.insert1(key)
             Segmentation.CNMF().make(key)
         elif key["segmentation_method"] in [3, 4]:  # nmf_patches, nmf-boutons
@@ -2165,13 +2171,23 @@ class Activity(dj.Computed):
                     ignore_extra_fields=True,
                 )
 
-        elif key["spike_method"] == 6:  # dnmf
+        elif key["spike_method"] in [6, 7]:  # dnmf
             from pipeline.utils import caiman_interface as cmn
             import multiprocessing as mp
             from functools import partial
 
-            scan_fps = (ScanInfo & key).fetch1('fps')
-            deconvolve = partial(cmn.deconvolve_detrended, scan_fps=scan_fps)
+            scan_fps = (ScanInfo & key).fetch1("fps")
+            if key["spike_method"] == 7:  # dnmf-gcamp8s
+                profile = cmn.get_indicator_profile(indicator="gcamp8s", fps=scan_fps)
+                deconvolve = partial(
+                    cmn.deconvolve_detrended,
+                    scan_fps=scan_fps,
+                    detrend_period=profile["detrend_period"],
+                    AR_order=profile["ar_order"],
+                    fudge_factor=profile["fudge_factor"],
+                )
+            else:
+                deconvolve = partial(cmn.deconvolve_detrended, scan_fps=scan_fps)
             with mp.Pool(10) as pool:
                 results = pool.map(deconvolve, full_traces)
             for unit_id, (spike_trace, ar_coeffs) in zip(unit_ids, results):
