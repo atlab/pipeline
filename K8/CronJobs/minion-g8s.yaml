@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: CronJob # This tells kubernetes what kind of class it is working with
 metadata:
-  name: minion
+  name: minion-g8s
 spec:
   schedule: "*/5 * * * *" # every 5 minutes
   concurrencyPolicy: Allow
