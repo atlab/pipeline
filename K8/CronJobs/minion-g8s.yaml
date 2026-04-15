@@ -87,4 +87,4 @@ spec:
             pip3 install /data/stimulus-pipeline/python/ &&\
             git clone https://$(GITHUB_USERNAME):$(GITHUB_PASSWORD)@github.com/cajal/stimuli.git /data/stimuli &&\
             pip3 install /data/stimuli/python/ &&\
-            python3 /data/pipeline/python/scripts/populate-minion.py"]
+            python3 /data/pipeline/python/scripts/populate-minion-g8s.py"]
