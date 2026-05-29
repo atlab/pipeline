@@ -27,7 +27,7 @@ for schema in [stimulus, treadmill, pupil, posture, stack, reso, meso, fuse]:
 #                   (experiment.Scan() & 'scan_ts > "2019-01-01 00:00:00"'))
 
 next_scans = (experiment.AutoProcessing  & 'priority < 120' &
-              (experiment.Scan & 'scan_ts > "2019-01-01 00:00:00"'))
+              (experiment.Scan & 'scan_ts > "2026-01-01 00:00:00"'))
 
 # stimulus
 stimulus.Sync.populate(next_scans, reserve_jobs=True, suppress_errors=True)
@@ -36,6 +36,7 @@ stimulus.BehaviorSync.populate(next_scans, reserve_jobs=True, suppress_errors=Tr
 # treadmill, pupil, posture
 treadmill.Treadmill.populate(next_scans, reserve_jobs=True, suppress_errors=True)
 pupil.Eye.populate(next_scans, reserve_jobs=True, suppress_errors=True)
+pupil.FittedPupil.populate(next_scans, reserve_jobs=True, suppress_errors=True)
 posture.Posture.populate(next_scans, reserve_jobs=True, suppress_errors=True)
 
 # stack
