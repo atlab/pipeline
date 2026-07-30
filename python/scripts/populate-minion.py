@@ -27,7 +27,7 @@ for schema in [stimulus, treadmill, pupil, posture, stack, reso, meso, fuse]:
 #                   (experiment.Scan() & 'scan_ts > "2019-01-01 00:00:00"'))
 
 next_scans = (experiment.AutoProcessing  & 'priority < 120' &
-              (experiment.Scan & 'scan_ts > "2026-01-01 00:00:00"'))
+              ({'animal_id': 26614, 'session': 1, 'scan_idx': 17}))
 
 # stimulus
 stimulus.Sync.populate(next_scans, reserve_jobs=True, suppress_errors=True)
